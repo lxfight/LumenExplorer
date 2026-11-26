@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 description = "A high-fidelity Windows 11 file explorer written in Rust"
 license = "MIT"
-repository = "https://github.com/lumen-explorer/lumen"
+repository = "https://github.com/lxfight/LumenExplorer"
 keywords = ["file-manager", "explorer", "windows", "egui", "shell"]
 categories = ["gui"]
 

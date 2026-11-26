@@ -108,16 +108,19 @@ impl Entry {
 /// ordering — including **Chinese Pinyin** sorting on zh-CN systems and natural
 /// numeric runs (`file2` < `file10`) — with O(N) Win32 calls instead of O(N log N).
 pub fn locale_sort_key(text: &str) -> Vec<u8> {
+    // `PCWSTR::null()` is Win32 `LOCALE_NAME_USER_DEFAULT`.
+    locale_sort_key_for(windows::core::PCWSTR::null(), text)
+}
+
+fn locale_sort_key_for(locale: windows::core::PCWSTR, text: &str) -> Vec<u8> {
     use windows::Win32::Foundation::LPARAM;
     use windows::Win32::Globalization::{LCMAP_SORTKEY, LCMapStringEx, NORM_IGNORECASE, SORT_DIGITSASNUMBERS};
-    use windows::core::PCWSTR;
     if text.is_empty() {
         return Vec::new();
     }
     let wide: Vec<u16> = text.encode_utf16().collect();
-    // `PCWSTR::null()` is Win32 `LOCALE_NAME_USER_DEFAULT`.
     let flags = LCMAP_SORTKEY | SORT_DIGITSASNUMBERS.0 | NORM_IGNORECASE.0;
-    let needed = unsafe { LCMapStringEx(PCWSTR::null(), flags, &wide, None, None, None, LPARAM(0)) };
+    let needed = unsafe { LCMapStringEx(locale, flags, &wide, None, None, None, LPARAM(0)) };
     if needed <= 0 {
         return text.to_lowercase().into_bytes();
     }
@@ -125,7 +128,7 @@ pub fn locale_sort_key(text: &str) -> Vec<u8> {
     // `windows-rs` passes `buf.len()` as `cchDest`, so allocate `byte_len` u16s.
     let byte_len = needed as usize;
     let mut buf = vec![0u16; byte_len];
-    let written = unsafe { LCMapStringEx(PCWSTR::null(), flags, &wide, Some(&mut buf), None, None, LPARAM(0)) };
+    let written = unsafe { LCMapStringEx(locale, flags, &wide, Some(&mut buf), None, None, LPARAM(0)) };
     if written <= 0 {
         return text.to_lowercase().into_bytes();
     }
@@ -164,10 +167,11 @@ mod tests {
         names.sort_by_key(|name| locale_sort_key(name));
         assert_eq!(names, ["alpha.txt", "file1.txt", "File2.txt", "file10.txt"]);
 
-        // On zh-CN Windows, Chinese names sort by Pinyin rather than raw Unicode codepoints.
-        // Note: Unicode order is 博(535A) < 张(5F20) < 钟(949F) < 阿(963F), whereas Pinyin is 阿(a) < 博(b) < 张(z).
+        // Explicitly use `zh-CN` so Chinese Pinyin sorting is verified deterministically even on
+        // non-zh-CN CI runners (where `LOCALE_NAME_USER_DEFAULT` does not sort Chinese by Pinyin).
+        // Unicode order is 博(535A) < 张(5F20) < 钟(949F) < 阿(963F), whereas Pinyin is 阿(a) < 博(b) < 张(z).
         let mut cn = ["张.txt", "阿.txt", "博.txt"];
-        cn.sort_by_key(|name| locale_sort_key(name));
+        cn.sort_by_key(|name| locale_sort_key_for(windows::core::w!("zh-CN"), name));
         assert_eq!(cn, ["阿.txt", "博.txt", "张.txt"]);
     }
 }

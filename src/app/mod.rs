@@ -1311,7 +1311,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut app = LumenApp::with_context(&ctx, settings_for(root));
         let second = Location::from_path(&root.join("src")).expect("src dir");
-        let third = Location::from_path(&root.join("tools")).expect("tools dir");
+        let third = Location::from_path(&root.join("assets")).expect("assets dir");
         app.tabs.push(Tab::new(second.clone(), false, false));
         app.tabs.push(Tab::new(third.clone(), false, false));
         app.active = 2;
