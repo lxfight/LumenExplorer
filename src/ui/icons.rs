@@ -1,0 +1,47 @@
+//! Segoe Fluent Icons glyph constants (validated against the Windows 11 font).
+#![allow(dead_code)]
+
+pub const MENU: &str = "\u{E700}";
+pub const CHEVRON_DOWN: &str = "\u{E70D}";
+pub const CHEVRON_UP: &str = "\u{E70E}";
+pub const EDIT: &str = "\u{E70F}";
+pub const ADD: &str = "\u{E710}";
+pub const CANCEL: &str = "\u{E711}";
+pub const MORE: &str = "\u{E712}";
+pub const SETTINGS: &str = "\u{E713}";
+pub const PIN: &str = "\u{E718}";
+pub const STAR: &str = "\u{E734}";
+pub const STAR_FILLED: &str = "\u{E735}";
+pub const CHECK: &str = "\u{E73E}";
+pub const ARROW_UP: &str = "\u{E74A}";
+pub const DELETE: &str = "\u{E74D}";
+pub const SAVE: &str = "\u{E74E}";
+pub const CHEVRON_LEFT: &str = "\u{E76B}";
+pub const CHEVRON_RIGHT: &str = "\u{E76C}";
+pub const PASTE: &str = "\u{E77F}";
+pub const VIEW: &str = "\u{E890}";
+pub const FILE: &str = "\u{E8A5}";
+pub const OPEN_EXTERNAL: &str = "\u{E8A7}";
+pub const GRID: &str = "\u{E8A9}";
+pub const RENAME: &str = "\u{E8AC}";
+pub const FOLDER: &str = "\u{E8B7}";
+pub const CLOSE: &str = "\u{E8BB}";
+pub const LIST: &str = "\u{E8BC}";
+pub const CUT: &str = "\u{E8C6}";
+pub const COPY: &str = "\u{E8C8}";
+pub const SORT: &str = "\u{E8CB}";
+pub const FOLDER_NEW: &str = "\u{E8F4}";
+pub const LIST_BULLETS: &str = "\u{E8FD}";
+pub const MINIMIZE: &str = "\u{E921}";
+pub const MAXIMIZE: &str = "\u{E922}";
+pub const RESTORE: &str = "\u{E923}";
+pub const INFO: &str = "\u{E946}";
+pub const BACK: &str = "\u{E72B}";
+pub const FORWARD: &str = "\u{E72A}";
+pub const REFRESH: &str = "\u{E72C}";
+pub const SHARE: &str = "\u{E72D}";
+pub const SEARCH: &str = "\u{E721}";
+pub const HOME: &str = "\u{E80F}";
+pub const DOWNLOAD: &str = "\u{E896}";
+pub const HISTORY: &str = "\u{E81C}";
+pub const LINK: &str = "\u{E71B}";

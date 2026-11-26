@@ -1,0 +1,616 @@
+//! OLE drag & drop: drop target registration, live hover feedback, and drag source.
+//!
+//! Both COM objects are hand-written vtable objects: the windows-rs
+//! `#[implement]` macro emits absolute `::windows_core::` paths that only
+//! resolve when the crate depends on `windows-core` directly, and the pinned
+//! manifest has no such dependency. Only `windows::core` re-exports are used.
+
+use std::ffi::{OsString, c_void};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use anyhow::Context;
+use egui::{Pos2, Rect};
+use windows::Win32::Foundation::{
+    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_NOINTERFACE, POINT, POINTL, S_OK,
+};
+use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IBindCtx, IDataObject,
+    TYMED_HGLOBAL,
+};
+use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows::Win32::System::Ole::{
+    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE, DoDragDrop, IDropSource,
+    IDropSource_Vtbl, IDropTarget, IDropTarget_Vtbl, RegisterDragDrop, ReleaseStgMedium,
+};
+use windows::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON, MK_RBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS};
+/// `MK_ALT` (0x0020) from WinUser/OLE drag-drop key state flags.
+const MK_ALT: MODIFIERKEYS_FLAGS = MODIFIERKEYS_FLAGS(0x0020);
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::{
+    BHID_DataObject, CLSID_DragDropHelper, DragQueryFileW, HDROP, IDragSourceHelper, IShellItemArray,
+    SHCreateShellItemArrayFromIDLists, SHParseDisplayName,
+};
+use windows::core::{BOOL, GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, w};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropAction {
+    Copy,
+    Move,
+    Link,
+}
+
+#[derive(Clone, Debug)]
+pub struct DropEvent {
+    pub paths: Vec<PathBuf>,
+    pub position: Pos2,
+    pub action: DropAction,
+}
+
+#[derive(Clone, Debug)]
+pub struct DragHover {
+    pub position: Pos2,
+    pub target: Option<PathBuf>,
+    pub action: Option<DropAction>,
+}
+
+struct DropContext {
+    zones: Vec<(Rect, PathBuf)>,
+    current_dir: Option<PathBuf>,
+}
+
+static DROPS: Mutex<Vec<DropEvent>> = Mutex::new(Vec::new());
+static DRAG_HOVER: Mutex<Option<DragHover>> = Mutex::new(None);
+static DROP_CTX: Mutex<DropContext> = Mutex::new(DropContext { zones: Vec::new(), current_dir: None });
+static DROP_TARGET: OnceLock<TargetHandle> = OnceLock::new();
+
+#[allow(dead_code)]
+struct TargetHandle(IDropTarget);
+
+unsafe impl Send for TargetHandle {}
+unsafe impl Sync for TargetHandle {}
+
+/// Updates the active window's drop zones and current directory so OLE
+/// `DragOver` can apply Explorer's same-volume/cross-volume rules and highlight
+/// the hovered drop target in real time.
+pub fn update_drop_context(zones: &[(Rect, PathBuf)], current_dir: Option<PathBuf>) {
+    if let Ok(mut ctx) = DROP_CTX.lock() {
+        ctx.zones.clear();
+        ctx.zones.extend_from_slice(zones);
+        ctx.current_dir = current_dir;
+    }
+}
+
+/// Live drag-over target info for UI visual feedback (cleared on leave/drop).
+pub fn drag_hover() -> Option<DragHover> {
+    DRAG_HOVER.lock().ok().and_then(|g| g.clone())
+}
+
+fn resolve_target_dir(pos: Pos2) -> Option<PathBuf> {
+    let ctx = DROP_CTX.lock().ok()?;
+    ctx.zones
+        .iter()
+        .rev()
+        .find(|(rect, _)| rect.contains(pos))
+        .map(|(_, path)| path.clone())
+        .or_else(|| ctx.current_dir.clone())
+}
+
+/// Returns the volume mount root (e.g. `C:\` or `\\server\share\`) for a path.
+fn volume_root(path: &Path) -> Option<String> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut buf = [0u16; 260];
+    if unsafe { GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut buf) }.is_ok() {
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        return Some(String::from_utf16_lossy(&buf[..len]).to_ascii_lowercase());
+    }
+    // Fallback for non-existent paths or UNC prefixes: compare prefix component.
+    use std::path::Component;
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => Some(prefix.as_os_str().to_string_lossy().to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+fn same_volume(src: &Path, dst: &Path) -> bool {
+    match (volume_root(src), volume_root(dst)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn is_self_or_ancestor(src: &Path, dst: &Path) -> bool {
+    let s = src.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase();
+    let d = dst.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase();
+    d == s || (d.len() > s.len() && d.starts_with(&s) && d.as_bytes().get(s.len()) == Some(&b'\\'))
+}
+
+/// Explorer drag-drop effect rules:
+/// - `Ctrl` forces Copy; `Shift` forces Move; `Alt` forces Link (shortcut).
+/// - Otherwise same volume defaults to Move, cross volume defaults to Copy.
+/// - Intersected with `allowed` (`dwOkEffect` from the drag source).
+fn choose_effect(
+    modifiers: MODIFIERKEYS_FLAGS,
+    allowed: DROPEFFECT,
+    preferred: DROPEFFECT,
+    paths: &[PathBuf],
+    target: Option<&Path>,
+) -> DROPEFFECT {
+    if paths.is_empty() {
+        return DROPEFFECT_NONE;
+    }
+    // Reject dropping a folder onto itself or inside itself.
+    if let Some(dst) = target
+        && paths.iter().any(|p| p.is_dir() && is_self_or_ancestor(p, dst))
+    {
+        return DROPEFFECT_NONE;
+    }
+    let has = |e: DROPEFFECT| allowed.0 == 0 || (allowed.0 & e.0) != 0;
+    let chosen = if modifiers.contains(MK_ALT) && has(DROPEFFECT_LINK) {
+        DROPEFFECT_LINK
+    } else if modifiers.contains(MK_CONTROL) && has(DROPEFFECT_COPY) {
+        DROPEFFECT_COPY
+    } else if modifiers.contains(MK_SHIFT) && has(DROPEFFECT_MOVE) {
+        DROPEFFECT_MOVE
+    } else {
+        let source_only_copies = preferred.contains(DROPEFFECT_COPY) && !preferred.contains(DROPEFFECT_MOVE);
+        let same_vol = target.is_some_and(|dst| paths.first().is_some_and(|src| same_volume(src, dst)));
+        if source_only_copies || !same_vol {
+            if has(DROPEFFECT_COPY) {
+                DROPEFFECT_COPY
+            } else if has(DROPEFFECT_MOVE) {
+                DROPEFFECT_MOVE
+            } else {
+                DROPEFFECT_NONE
+            }
+        } else if has(DROPEFFECT_MOVE) {
+            DROPEFFECT_MOVE
+        } else if has(DROPEFFECT_COPY) {
+            DROPEFFECT_COPY
+        } else {
+            DROPEFFECT_NONE
+        }
+    };
+    // Moving files directly back onto their own parent directory is a no-op.
+    if chosen == DROPEFFECT_MOVE
+        && let Some(dst) = target
+        && paths
+            .iter()
+            .all(|p| p.parent().is_some_and(|parent| parent.as_os_str().eq_ignore_ascii_case(dst.as_os_str())))
+    {
+        return DROPEFFECT_NONE;
+    }
+    chosen
+}
+
+fn effect_to_action(effect: DROPEFFECT) -> Option<DropAction> {
+    if effect == DROPEFFECT_MOVE {
+        Some(DropAction::Move)
+    } else if effect == DROPEFFECT_COPY {
+        Some(DropAction::Copy)
+    } else if effect == DROPEFFECT_LINK {
+        Some(DropAction::Link)
+    } else {
+        None
+    }
+}
+
+/// Formats handed out by the platform for shell file transfer.
+fn hdrop_format() -> FORMATETC {
+    FORMATETC {
+        cfFormat: CF_HDROP.0,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    }
+}
+
+fn hglobal_format(format: u32) -> FORMATETC {
+    FORMATETC {
+        cfFormat: format as u16,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    }
+}
+
+fn object_paths(data: &IDataObject) -> Vec<PathBuf> {
+    let mut medium = match unsafe { data.GetData(&hdrop_format()) } {
+        Ok(medium) => medium,
+        Err(_) => return Vec::new(),
+    };
+    let hdrop = HDROP(unsafe { medium.u.hGlobal.0 });
+    let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
+    let mut paths = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let len = unsafe { DragQueryFileW(hdrop, index, None) } as usize;
+        let mut buffer = vec![0u16; len + 1];
+        let written = unsafe { DragQueryFileW(hdrop, index, Some(&mut buffer)) } as usize;
+        buffer.truncate(written);
+        paths.push(PathBuf::from(OsString::from_wide(&buffer)));
+    }
+    unsafe { ReleaseStgMedium(&mut medium) };
+    paths
+}
+
+fn object_preferred_effect(data: &IDataObject) -> DROPEFFECT {
+    let format = hglobal_format(unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) });
+    let Ok(mut medium) = (unsafe { data.GetData(&format) }) else {
+        return DROPEFFECT_NONE;
+    };
+    let global = unsafe { medium.u.hGlobal };
+    let ptr = unsafe { GlobalLock(global) } as *const u32;
+    if ptr.is_null() {
+        unsafe { ReleaseStgMedium(&mut medium) };
+        return DROPEFFECT_NONE;
+    }
+    let effect = unsafe { ptr.read_unaligned() };
+    unsafe {
+        let _ = GlobalUnlock(global);
+        ReleaseStgMedium(&mut medium);
+    }
+    DROPEFFECT(effect)
+}
+
+fn client_position(pt: POINTL) -> Pos2 {
+    let hwnd = crate::platform::hwnd();
+    if hwnd.0.is_null() {
+        return Pos2::new(pt.x as f32, pt.y as f32);
+    }
+    let mut point = POINT { x: pt.x, y: pt.y };
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut point);
+        let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+        Pos2::new(point.x as f32 / scale, point.y as f32 / scale)
+    }
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct TargetObject {
+    vtable: *const IDropTarget_Vtbl,
+    refs: AtomicU32,
+    paths: Mutex<Vec<PathBuf>>,
+    preferred: AtomicU32,
+}
+
+unsafe extern "system" fn target_query_interface(
+    this: *mut c_void,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    let iid = unsafe { &*iid };
+    if *iid == IUnknown::IID || *iid == IDropTarget::IID {
+        unsafe { *out = this };
+        unsafe { target_add_ref(this) };
+        S_OK
+    } else {
+        unsafe { *out = std::ptr::null_mut() };
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn target_add_ref(this: *mut c_void) -> u32 {
+    let target = unsafe { &*(this as *const TargetObject) };
+    target.refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn target_release(this: *mut c_void) -> u32 {
+    let target = unsafe { &*(this as *const TargetObject) };
+    let remaining = target.refs.fetch_sub(1, Ordering::Release) - 1;
+    if remaining == 0 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        unsafe { drop(Box::from_raw(this as *mut TargetObject)) };
+    }
+    remaining
+}
+
+unsafe extern "system" fn target_drag_enter(
+    this: *mut c_void,
+    data: *mut c_void,
+    modifiers: MODIFIERKEYS_FLAGS,
+    pt: POINTL,
+    effect: *mut DROPEFFECT,
+) -> HRESULT {
+    let target = unsafe { &*(this as *const TargetObject) };
+    let object = unsafe { IDataObject::from_raw_borrowed(&data) };
+    let (paths, preferred) = match object {
+        Some(object) => (object_paths(object), object_preferred_effect(object)),
+        None => (Vec::new(), DROPEFFECT_NONE),
+    };
+    let pos = client_position(pt);
+    let dst = resolve_target_dir(pos);
+    let allowed = unsafe { *effect };
+    let chosen = choose_effect(modifiers, allowed, preferred, &paths, dst.as_deref());
+    *target.paths.lock().unwrap() = paths;
+    target.preferred.store(preferred.0, Ordering::Relaxed);
+    unsafe { *effect = chosen };
+    *DRAG_HOVER.lock().unwrap() = Some(DragHover { position: pos, target: dst, action: effect_to_action(chosen) });
+    crate::platform::wake();
+    S_OK
+}
+
+unsafe extern "system" fn target_drag_over(
+    this: *mut c_void,
+    modifiers: MODIFIERKEYS_FLAGS,
+    pt: POINTL,
+    effect: *mut DROPEFFECT,
+) -> HRESULT {
+    let target = unsafe { &*(this as *const TargetObject) };
+    let paths = target.paths.lock().unwrap();
+    let preferred = DROPEFFECT(target.preferred.load(Ordering::Relaxed));
+    let pos = client_position(pt);
+    let dst = resolve_target_dir(pos);
+    let allowed = unsafe { *effect };
+    let chosen = choose_effect(modifiers, allowed, preferred, &paths, dst.as_deref());
+    unsafe { *effect = chosen };
+    *DRAG_HOVER.lock().unwrap() = Some(DragHover { position: pos, target: dst, action: effect_to_action(chosen) });
+    crate::platform::wake();
+    S_OK
+}
+
+unsafe extern "system" fn target_drag_leave(this: *mut c_void) -> HRESULT {
+    let target = unsafe { &*(this as *const TargetObject) };
+    target.paths.lock().unwrap().clear();
+    target.preferred.store(DROPEFFECT_NONE.0, Ordering::Relaxed);
+    *DRAG_HOVER.lock().unwrap() = None;
+    crate::platform::wake();
+    S_OK
+}
+
+unsafe extern "system" fn target_drop(
+    this: *mut c_void,
+    _data: *mut c_void,
+    modifiers: MODIFIERKEYS_FLAGS,
+    pt: POINTL,
+    effect: *mut DROPEFFECT,
+) -> HRESULT {
+    let target = unsafe { &*(this as *const TargetObject) };
+    let paths = std::mem::take(&mut *target.paths.lock().unwrap());
+    let preferred = DROPEFFECT(target.preferred.swap(DROPEFFECT_NONE.0, Ordering::Relaxed));
+    *DRAG_HOVER.lock().unwrap() = None;
+
+    let pos = client_position(pt);
+    let dst = resolve_target_dir(pos);
+    let allowed = unsafe { *effect };
+    let chosen = choose_effect(modifiers, allowed, preferred, &paths, dst.as_deref());
+    unsafe { *effect = chosen };
+    let Some(action) = effect_to_action(chosen) else {
+        crate::platform::wake();
+        return S_OK;
+    };
+    DROPS.lock().unwrap().push(DropEvent { paths, position: pos, action });
+    // Nothing else tells an idle window that a drop just landed.
+    crate::platform::wake();
+    S_OK
+}
+
+static TARGET_VTABLE: IDropTarget_Vtbl = IDropTarget_Vtbl {
+    base__: IUnknown_Vtbl { QueryInterface: target_query_interface, AddRef: target_add_ref, Release: target_release },
+    DragEnter: target_drag_enter,
+    DragOver: target_drag_over,
+    DragLeave: target_drag_leave,
+    Drop: target_drop,
+};
+
+fn new_target() -> IDropTarget {
+    let object = Box::new(TargetObject {
+        vtable: &TARGET_VTABLE,
+        refs: AtomicU32::new(1),
+        paths: Mutex::new(Vec::new()),
+        preferred: AtomicU32::new(DROPEFFECT_NONE.0),
+    });
+    unsafe { IDropTarget::from_raw(Box::into_raw(object).cast::<c_void>()) }
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct SourceObject {
+    vtable: *const IDropSource_Vtbl,
+    refs: AtomicU32,
+}
+
+unsafe extern "system" fn source_query_interface(
+    this: *mut c_void,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    let iid = unsafe { &*iid };
+    if *iid == IUnknown::IID || *iid == IDropSource::IID {
+        unsafe { *out = this };
+        unsafe { source_add_ref(this) };
+        S_OK
+    } else {
+        unsafe { *out = std::ptr::null_mut() };
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn source_add_ref(this: *mut c_void) -> u32 {
+    let source = unsafe { &*(this as *const SourceObject) };
+    source.refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn source_release(this: *mut c_void) -> u32 {
+    let source = unsafe { &*(this as *const SourceObject) };
+    let remaining = source.refs.fetch_sub(1, Ordering::Release) - 1;
+    if remaining == 0 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        unsafe { drop(Box::from_raw(this as *mut SourceObject)) };
+    }
+    remaining
+}
+
+unsafe extern "system" fn source_query_continue_drag(
+    _this: *mut c_void,
+    escape: BOOL,
+    keys: MODIFIERKEYS_FLAGS,
+) -> HRESULT {
+    if escape.as_bool() {
+        DRAGDROP_S_CANCEL
+    } else if !keys.contains(MK_LBUTTON) && !keys.contains(MK_RBUTTON) {
+        DRAGDROP_S_DROP
+    } else {
+        S_OK
+    }
+}
+
+unsafe extern "system" fn source_give_feedback(_this: *mut c_void, _effect: DROPEFFECT) -> HRESULT {
+    DRAGDROP_S_USEDEFAULTCURSORS
+}
+
+static SOURCE_VTABLE: IDropSource_Vtbl = IDropSource_Vtbl {
+    base__: IUnknown_Vtbl { QueryInterface: source_query_interface, AddRef: source_add_ref, Release: source_release },
+    QueryContinueDrag: source_query_continue_drag,
+    GiveFeedback: source_give_feedback,
+};
+
+fn new_source() -> IDropSource {
+    let object = Box::new(SourceObject { vtable: &SOURCE_VTABLE, refs: AtomicU32::new(1) });
+    unsafe { IDropSource::from_raw(Box::into_raw(object).cast::<c_void>()) }
+}
+
+/// Registers the window as an OLE drop target. Call once after the window exists.
+pub fn register_drop_target() -> anyhow::Result<()> {
+    if DROP_TARGET.get().is_some() {
+        return Ok(());
+    }
+    let hwnd = crate::platform::hwnd();
+    anyhow::ensure!(!hwnd.0.is_null(), "register_drop_target called before the window was attached");
+    let target = new_target();
+    unsafe { RegisterDragDrop(hwnd, &target) }.context("RegisterDragDrop failed")?;
+    let _ = DROP_TARGET.set(TargetHandle(target));
+    Ok(())
+}
+
+/// Pops the oldest finished drop, one per call.
+pub fn take_drop() -> Option<DropEvent> {
+    let mut drops = DROPS.lock().unwrap();
+    if drops.is_empty() { None } else { Some(drops.remove(0)) }
+}
+
+struct AbsolutePidl(*mut ITEMIDLIST);
+
+impl Drop for AbsolutePidl {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.0.cast::<c_void>())) };
+    }
+}
+
+fn absolute_pidl(path: &Path) -> anyhow::Result<AbsolutePidl> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>, &mut pidl, 0, None) }
+        .with_context(|| format!("SHParseDisplayName failed for {}", path.display()))?;
+    anyhow::ensure!(!pidl.is_null(), "SHParseDisplayName produced no PIDL for {}", path.display());
+    Ok(AbsolutePidl(pidl))
+}
+
+/// Shell data object for the given files, carrying CF_HDROP and shell ID lists.
+fn data_object(paths: &[PathBuf]) -> anyhow::Result<IDataObject> {
+    let pidls = paths.iter().map(|path| absolute_pidl(path)).collect::<anyhow::Result<Vec<_>>>()?;
+    let raw: Vec<*const ITEMIDLIST> = pidls.iter().map(|pidl| pidl.0.cast_const()).collect();
+    let items: IShellItemArray =
+        unsafe { SHCreateShellItemArrayFromIDLists(&raw) }.context("SHCreateShellItemArrayFromIDLists failed")?;
+    unsafe { items.BindToHandler(None::<&IBindCtx>, &BHID_DataObject) }
+        .context("IShellItemArray::BindToHandler(BHID_DataObject) failed")
+}
+
+/// Starts an OLE drag of the given files and blocks until the drag finishes.
+pub fn drag_out(paths: &[PathBuf]) -> anyhow::Result<()> {
+    anyhow::ensure!(!paths.is_empty(), "drag_out needs at least one path");
+    let data = data_object(paths)?;
+    // Attach Windows shell drag ghost helper when available.
+    if let Ok(helper) =
+        unsafe { CoCreateInstance::<_, IDragSourceHelper>(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }
+    {
+        let mut pt = POINT::default();
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) };
+        let _ = unsafe { helper.InitializeFromWindow(Some(crate::platform::hwnd()), Some(&pt), &data) };
+    }
+    let source = new_source();
+    let mut effect = DROPEFFECT_NONE;
+    unsafe { DoDragDrop(&data, &source, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &mut effect) }
+        .ok()
+        .context("DoDragDrop failed")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::SystemServices::{MK_CONTROL, MK_SHIFT};
+
+    fn fixture_files() -> (PathBuf, PathBuf, Vec<PathBuf>) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("tmp").join("dnd-test");
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let files = vec![src.join("one.txt"), src.join("二.txt")];
+        for file in &files {
+            std::fs::write(file, b"lumen").unwrap();
+        }
+        (src, dst, files)
+    }
+
+    #[test]
+    fn drop_target_respects_ole_allowed_mask_and_modifiers() {
+        unsafe { windows::Win32::System::Ole::OleInitialize(None) }.unwrap();
+        let (_src, dst, files) = fixture_files();
+        update_drop_context(&[], Some(dst.clone()));
+        let data = data_object(&files).unwrap();
+        assert_eq!(object_paths(&data), files);
+
+        let target = new_target();
+        let point = POINTL { x: 0, y: 0 };
+        let all_allowed = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+
+        // Default same-volume drop with all effects allowed -> Move (NOT Copy!).
+        let mut effect = all_allowed;
+        unsafe { target.DragEnter(&data, MODIFIERKEYS_FLAGS(0), point, &mut effect) }.unwrap();
+        assert_eq!(effect, DROPEFFECT_MOVE);
+
+        // Windows passes `dwOkEffect` (bitmask) into Drop; target must recompute and write back.
+        let mut drop_effect = all_allowed;
+        unsafe { target.Drop(&data, MODIFIERKEYS_FLAGS(0), point, &mut drop_effect) }.unwrap();
+        assert_eq!(drop_effect, DROPEFFECT_MOVE);
+        let event = take_drop().expect("drop was not queued");
+        assert_eq!(event.paths, files);
+        assert_eq!(event.action, DropAction::Move);
+        assert!(take_drop().is_none());
+
+        // Ctrl forces Copy.
+        let mut effect = all_allowed;
+        unsafe { target.DragEnter(&data, MK_CONTROL, point, &mut effect) }.unwrap();
+        assert_eq!(effect, DROPEFFECT_COPY);
+        let mut drop_effect = all_allowed;
+        unsafe { target.Drop(&data, MK_CONTROL, point, &mut drop_effect) }.unwrap();
+        assert_eq!(drop_effect, DROPEFFECT_COPY);
+        assert_eq!(take_drop().unwrap().action, DropAction::Copy);
+
+        // Alt forces Link (shortcut).
+        let mut effect = all_allowed;
+        unsafe { target.DragEnter(&data, MK_ALT, point, &mut effect) }.unwrap();
+        assert_eq!(effect, DROPEFFECT_LINK);
+        let mut drop_effect = all_allowed;
+        unsafe { target.Drop(&data, MK_ALT, point, &mut drop_effect) }.unwrap();
+        assert_eq!(drop_effect, DROPEFFECT_LINK);
+        assert_eq!(take_drop().unwrap().action, DropAction::Link);
+
+        // Shift forces Move even when source prefers Copy.
+        let mut effect = all_allowed;
+        unsafe { target.DragEnter(&data, MK_SHIFT, point, &mut effect) }.unwrap();
+        assert_eq!(effect, DROPEFFECT_MOVE);
+        unsafe { target.DragLeave() }.unwrap();
+        assert!(drag_hover().is_none());
+    }
+}

@@ -1,0 +1,9 @@
+# Build artifacts
+/target
+target/
+
+# Local development docs, scripts, and captures
+/IMPLEMENTATION_PLAN.md
+/docs/
+/tools/
+/*_shots

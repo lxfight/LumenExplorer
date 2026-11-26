@@ -1,0 +1,71 @@
+[package]
+name = "lumen"
+version = "0.2.0"
+edition = "2024"
+description = "A high-fidelity Windows 11 file explorer written in Rust"
+license = "MIT"
+repository = "https://github.com/lumen-explorer/lumen"
+keywords = ["file-manager", "explorer", "windows", "egui", "shell"]
+categories = ["gui"]
+
+[dependencies]
+egui = "0.37"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "clipboard"] }
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Ole",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_System_LibraryLoader",
+  "Win32_System_DataExchange",
+  "Win32_System_SystemServices",
+  "Win32_System_SystemInformation",
+  "Win32_System_Time",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
+  "Win32_System_IO",
+  "Win32_Storage_FileSystem",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Controls",
+  "Win32_UI_HiDpi",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Imaging",
+  "Win32_System_Search",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_Storage_EnhancedStorage",
+  "Win32_System_Variant",
+  "Win32_System_Environment",
+  "Win32_UI_Input_Ime",
+  "Win32_Security",
+  "Win32_Globalization",
+  "Win32_System_Pipes",
+] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+anyhow = "1"
+raw-window-handle = "0.6"
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+# A panic in a shell worker must not unwind through winit/COM frames.
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

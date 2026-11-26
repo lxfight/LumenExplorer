@@ -1,0 +1,12 @@
+pub mod chrome;
+pub mod context_menu;
+pub mod details;
+pub mod filelist;
+pub mod icons;
+pub mod overlays;
+pub mod quicklook;
+pub mod settings_ui;
+pub mod sidebar;
+pub mod spring;
+pub mod statusbar;
+pub mod widgets;
