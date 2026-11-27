@@ -1,5 +1,7 @@
 # LumenExplorer 压力测试报告
 
+本报告的两轮 5 分钟负载数据来自合并远端 v0.3.0 前的本地修复版本。合并后的验证记录见文末；不同版本的数据不作为直接性能对照。
+
 日期：2026-11-27（北京时间）。修复后测试总耗时 424.9 秒，另有约 2 秒销毁观察；其中持续负载 300 秒。首轮测试总耗时 413.0 秒。两轮测试均成功退出，未触发崩溃、操作超时、历史记录超限或单帧处理超过 5 秒的断言。
 
 ## 测试范围与环境
@@ -72,3 +74,14 @@
 - 首轮：`G:\LX\lumen\LumenExplorer\target\stress-runs\1795785440`（report.json、process-monitor.jsonl）。
 - 修复后：`G:\LX\lumen\LumenExplorer\target\stress-runs\1795786050`（report.json、process-monitor.jsonl、environment.json）。
 - 最新目录指针：`target/stress-runs/latest.txt`。
+
+## 合并远端 v0.3.0 后的验证
+
+以 `ec4a24c` 的远端更新为基础整合本地修复，保留远端的安装器、更新器及界面调整。删除和还原结果同时保留精确回收站标识与受影响目录，后台还原完成后刷新相关窗格。IPC 服务端补充读取客户端提前断开时仍留在管道中的请求。
+
+- `cargo test --locked -- --test-threads=1`：171 项通过，0 项失败，2 项按设计忽略，耗时 11.80 秒。
+- `cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets -- -D warnings`：通过。
+- `cargo build --locked --release`：通过。
+- 剪贴板集成测试增加事务互斥和占用重试；CI 与 Release 工作流串行运行测试，避免共享系统状态的并发干扰。
+
+本节记录合并版本的功能回归和构建检查，前文的两轮 5 分钟负载数据仍对应合并前的本地版本。

@@ -153,13 +153,15 @@ assets/              # 应用图标与 Windows 资源清单
 
 ```powershell
 # 运行测试、格式检查与 Lint
-cargo test
+cargo test -- --test-threads=1
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 
 # 构建 Release 可执行文件
 cargo build --release
 ```
+
+剪贴板、OLE 和窗口集成测试使用 Windows 共享状态，完整测试需串行运行；CI 和 Release 工作流已设置 `RUST_TEST_THREADS=1`。
 
 ### 构建 Windows 安装包
 

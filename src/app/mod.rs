@@ -1870,7 +1870,7 @@ mod tests {
 
     #[test]
     fn clipboard_shortcuts_copy_and_cut_files_with_navigation_pane_focus() {
-        let _clipboard = crate::shell::clipboard::CLIPBOARD_TEST_LOCK.lock().unwrap();
+        let _clipboard = crate::shell::clipboard::CLIPBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _com = Com::init();
         let stamp = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root =
@@ -1926,12 +1926,11 @@ mod tests {
 
     #[test]
     fn clipboard_shortcuts_keep_full_text_paste_in_text_editors() {
-        let _clipboard = crate::shell::clipboard::CLIPBOARD_TEST_LOCK.lock().unwrap();
+        let _clipboard = crate::shell::clipboard::CLIPBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _com = Com::init();
         let (mut app, ctx) = app_with(Vec::new());
         app.address.editing = true;
         let text = "剪贴板文本".repeat(400);
-        crate::shell::clipboard::set_text(&text).unwrap();
         let id = egui::Id::unique("paste-text-edit");
         let mut value = String::new();
         let mut first = ctx.run_pass(egui::RawInput::default(), |ctx| {
@@ -1940,14 +1939,25 @@ mod tests {
         });
         first.textures_delta.clear();
         let mut raw = egui::RawInput::default();
-        raw.events.push(egui::Event::Key {
-            key: egui::Key::V,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::CTRL,
-        });
-        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        // Clipboard listeners outside this process may briefly lock or replace it.
+        // Capture a verified paste event before testing TextEdit's consumption.
+        for _ in 0..50 {
+            raw.events = vec![egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }];
+            if crate::shell::clipboard::set_text(&text).is_ok() {
+                eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+                if matches!(raw.events.first(), Some(egui::Event::Paste(value)) if value == &text) {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(raw.events.first(), Some(egui::Event::Paste(value)) if value == &text));
         let mut output = ctx.run_pass(raw, |ctx| {
             app.handle_input(ctx);
             let mut ui = egui::Ui::new(ctx.clone(), egui::Id::unique("paste-text-ui"), egui::UiBuilder::new());
