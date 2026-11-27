@@ -47,10 +47,11 @@ pub fn spawn(generation: u64, input: String) -> Receiver<Suggestions> {
 }
 
 fn compute_suggestions(buf: &str) -> Vec<(String, PathBuf)> {
-    if buf.is_empty() {
+    let normalized = crate::shell::location::normalize_drive_spec(buf);
+    if normalized.is_empty() {
         return Vec::new();
     }
-    let expanded = crate::shell::location::expand_env(buf);
+    let expanded = crate::shell::location::normalize_drive_spec(&crate::shell::location::expand_env(&normalized));
     let path = PathBuf::from(&expanded);
     let (parent, prefix) = if expanded.ends_with('\\') || expanded.ends_with('/') {
         (Some(path), String::new())
@@ -80,4 +81,23 @@ fn compute_suggestions(buf: &str) -> Vec<(String, PathBuf)> {
     matches.sort_by_key(|(name, _)| crate::core::model::locale_sort_key(name));
     matches.truncate(8);
     matches
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggests_drive_root_children_for_bare_drive_specs() {
+        for input in ["C:", "c:", r#"C:""#, r"C:\."] {
+            let items = compute_suggestions(input);
+            assert!(!items.is_empty(), "expected root directory suggestions for {input:?}");
+            assert!(
+                items.iter().all(|(_, p)| p.parent().is_some_and(|par| par.as_os_str().eq_ignore_ascii_case(r"C:\"))),
+                "suggestions for {input:?} were not children of C:\\: {items:?}"
+            );
+        }
+        assert!(compute_suggestions("").is_empty());
+        assert!(compute_suggestions("   ").is_empty());
+    }
 }

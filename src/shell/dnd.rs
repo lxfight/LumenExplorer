@@ -20,10 +20,10 @@ use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IBindCtx, IDataObject,
-    TYMED_HGLOBAL,
+    STGMEDIUM, TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{
     CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE, DoDragDrop, IDropSource,
     IDropSource_Vtbl, IDropTarget, IDropTarget_Vtbl, RegisterDragDrop, ReleaseStgMedium,
@@ -63,11 +63,13 @@ pub struct DragHover {
 struct DropContext {
     zones: Vec<(Rect, PathBuf)>,
     current_dir: Option<PathBuf>,
+    pin_drop_rect: Option<Rect>,
 }
 
 static DROPS: Mutex<Vec<DropEvent>> = Mutex::new(Vec::new());
 static DRAG_HOVER: Mutex<Option<DragHover>> = Mutex::new(None);
-static DROP_CTX: Mutex<DropContext> = Mutex::new(DropContext { zones: Vec::new(), current_dir: None });
+static DROP_CTX: Mutex<DropContext> =
+    Mutex::new(DropContext { zones: Vec::new(), current_dir: None, pin_drop_rect: None });
 static DROP_TARGET: OnceLock<TargetHandle> = OnceLock::new();
 
 #[allow(dead_code)]
@@ -87,19 +89,49 @@ pub fn update_drop_context(zones: &[(Rect, PathBuf)], current_dir: Option<PathBu
     }
 }
 
+/// Updates the Quick Access header rect where dragged folders can be pinned,
+/// independent of the current directory or `is_self_or_ancestor` checks.
+#[allow(dead_code)] // Wired in Wave 2 app layer
+pub fn set_pin_drop_rect(rect: Option<Rect>) {
+    if let Ok(mut ctx) = DROP_CTX.lock() {
+        ctx.pin_drop_rect = rect;
+    }
+}
+
 /// Live drag-over target info for UI visual feedback (cleared on leave/drop).
 pub fn drag_hover() -> Option<DragHover> {
     DRAG_HOVER.lock().ok().and_then(|g| g.clone())
 }
 
-fn resolve_target_dir(pos: Pos2) -> Option<PathBuf> {
-    let ctx = DROP_CTX.lock().ok()?;
-    ctx.zones
-        .iter()
-        .rev()
-        .find(|(rect, _)| rect.contains(pos))
-        .map(|(_, path)| path.clone())
-        .or_else(|| ctx.current_dir.clone())
+enum ResolvedDrop {
+    PinQuickAccess,
+    Dir(PathBuf),
+    None,
+}
+
+impl ResolvedDrop {
+    fn dir_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Dir(path) => Some(path.clone()),
+            Self::PinQuickAccess | Self::None => None,
+        }
+    }
+}
+
+fn resolve_drop_target(pos: Pos2) -> ResolvedDrop {
+    let Ok(ctx) = DROP_CTX.lock() else {
+        return ResolvedDrop::None;
+    };
+    if ctx.pin_drop_rect.is_some_and(|r| r.contains(pos)) {
+        return ResolvedDrop::PinQuickAccess;
+    }
+    if let Some((_, path)) = ctx.zones.iter().rev().find(|(rect, _)| rect.contains(pos)) {
+        return ResolvedDrop::Dir(path.clone());
+    }
+    if let Some(dir) = &ctx.current_dir {
+        return ResolvedDrop::Dir(dir.clone());
+    }
+    ResolvedDrop::None
 }
 
 /// Returns the volume mount root (e.g. `C:\` or `\\server\share\`) for a path.
@@ -132,6 +164,8 @@ fn is_self_or_ancestor(src: &Path, dst: &Path) -> bool {
 }
 
 /// Explorer drag-drop effect rules:
+/// - Over the Quick Access pin target: allow pinning directories with `Link` (or allowed effect).
+/// - Over a non-filesystem view with no drop zone (`This PC` empty area, Network): disallow (`NONE`).
 /// - `Ctrl` forces Copy; `Shift` forces Move; `Alt` forces Link (shortcut).
 /// - Otherwise same volume defaults to Move, cross volume defaults to Copy.
 /// - Intersected with `allowed` (`dwOkEffect` from the drag source).
@@ -140,18 +174,34 @@ fn choose_effect(
     allowed: DROPEFFECT,
     preferred: DROPEFFECT,
     paths: &[PathBuf],
-    target: Option<&Path>,
+    target: &ResolvedDrop,
 ) -> DROPEFFECT {
     if paths.is_empty() {
         return DROPEFFECT_NONE;
     }
+    let has = |e: DROPEFFECT| allowed.0 == 0 || (allowed.0 & e.0) != 0;
+    let dst = match target {
+        ResolvedDrop::PinQuickAccess => {
+            if !paths.iter().any(|p| p.is_dir()) {
+                return DROPEFFECT_NONE;
+            }
+            return if has(DROPEFFECT_LINK) {
+                DROPEFFECT_LINK
+            } else if has(DROPEFFECT_COPY) {
+                DROPEFFECT_COPY
+            } else if has(DROPEFFECT_MOVE) {
+                DROPEFFECT_MOVE
+            } else {
+                DROPEFFECT_NONE
+            };
+        }
+        ResolvedDrop::None => return DROPEFFECT_NONE,
+        ResolvedDrop::Dir(dir) => dir.as_path(),
+    };
     // Reject dropping a folder onto itself or inside itself.
-    if let Some(dst) = target
-        && paths.iter().any(|p| p.is_dir() && is_self_or_ancestor(p, dst))
-    {
+    if paths.iter().any(|p| p.is_dir() && is_self_or_ancestor(p, dst)) {
         return DROPEFFECT_NONE;
     }
-    let has = |e: DROPEFFECT| allowed.0 == 0 || (allowed.0 & e.0) != 0;
     let chosen = if modifiers.contains(MK_ALT) && has(DROPEFFECT_LINK) {
         DROPEFFECT_LINK
     } else if modifiers.contains(MK_CONTROL) && has(DROPEFFECT_COPY) {
@@ -160,7 +210,7 @@ fn choose_effect(
         DROPEFFECT_MOVE
     } else {
         let source_only_copies = preferred.contains(DROPEFFECT_COPY) && !preferred.contains(DROPEFFECT_MOVE);
-        let same_vol = target.is_some_and(|dst| paths.first().is_some_and(|src| same_volume(src, dst)));
+        let same_vol = paths.first().is_some_and(|src| same_volume(src, dst));
         if source_only_copies || !same_vol {
             if has(DROPEFFECT_COPY) {
                 DROPEFFECT_COPY
@@ -179,7 +229,6 @@ fn choose_effect(
     };
     // Moving files directly back onto their own parent directory is a no-op.
     if chosen == DROPEFFECT_MOVE
-        && let Some(dst) = target
         && paths
             .iter()
             .all(|p| p.parent().is_some_and(|parent| parent.as_os_str().eq_ignore_ascii_case(dst.as_os_str())))
@@ -227,7 +276,15 @@ fn object_paths(data: &IDataObject) -> Vec<PathBuf> {
         Ok(medium) => medium,
         Err(_) => return Vec::new(),
     };
+    if medium.tymed != TYMED_HGLOBAL.0 as u32 {
+        unsafe { ReleaseStgMedium(&mut medium) };
+        return Vec::new();
+    }
     let hdrop = HDROP(unsafe { medium.u.hGlobal.0 });
+    if hdrop.0.is_null() {
+        unsafe { ReleaseStgMedium(&mut medium) };
+        return Vec::new();
+    }
     let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
     let mut paths = Vec::with_capacity(count as usize);
     for index in 0..count {
@@ -241,23 +298,31 @@ fn object_paths(data: &IDataObject) -> Vec<PathBuf> {
     paths
 }
 
+unsafe fn read_preferred_effect_medium(medium: &STGMEDIUM) -> DROPEFFECT {
+    if medium.tymed != TYMED_HGLOBAL.0 as u32 {
+        return DROPEFFECT_NONE;
+    }
+    let global = unsafe { medium.u.hGlobal };
+    if global.0.is_null() || unsafe { GlobalSize(global) } < std::mem::size_of::<u32>() {
+        return DROPEFFECT_NONE;
+    }
+    let ptr = unsafe { GlobalLock(global) } as *const u32;
+    if ptr.is_null() {
+        return DROPEFFECT_NONE;
+    }
+    let effect = unsafe { ptr.read_unaligned() };
+    let _ = unsafe { GlobalUnlock(global) };
+    DROPEFFECT(effect)
+}
+
 fn object_preferred_effect(data: &IDataObject) -> DROPEFFECT {
     let format = hglobal_format(unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) });
     let Ok(mut medium) = (unsafe { data.GetData(&format) }) else {
         return DROPEFFECT_NONE;
     };
-    let global = unsafe { medium.u.hGlobal };
-    let ptr = unsafe { GlobalLock(global) } as *const u32;
-    if ptr.is_null() {
-        unsafe { ReleaseStgMedium(&mut medium) };
-        return DROPEFFECT_NONE;
-    }
-    let effect = unsafe { ptr.read_unaligned() };
-    unsafe {
-        let _ = GlobalUnlock(global);
-        ReleaseStgMedium(&mut medium);
-    }
-    DROPEFFECT(effect)
+    let effect = unsafe { read_preferred_effect_medium(&medium) };
+    unsafe { ReleaseStgMedium(&mut medium) };
+    effect
 }
 
 fn client_position(pt: POINTL) -> Pos2 {
@@ -327,13 +392,14 @@ unsafe extern "system" fn target_drag_enter(
         None => (Vec::new(), DROPEFFECT_NONE),
     };
     let pos = client_position(pt);
-    let dst = resolve_target_dir(pos);
+    let resolved = resolve_drop_target(pos);
     let allowed = unsafe { *effect };
-    let chosen = choose_effect(modifiers, allowed, preferred, &paths, dst.as_deref());
+    let chosen = choose_effect(modifiers, allowed, preferred, &paths, &resolved);
     *target.paths.lock().unwrap() = paths;
     target.preferred.store(preferred.0, Ordering::Relaxed);
     unsafe { *effect = chosen };
-    *DRAG_HOVER.lock().unwrap() = Some(DragHover { position: pos, target: dst, action: effect_to_action(chosen) });
+    *DRAG_HOVER.lock().unwrap() =
+        Some(DragHover { position: pos, target: resolved.dir_path(), action: effect_to_action(chosen) });
     crate::platform::wake();
     S_OK
 }
@@ -348,11 +414,12 @@ unsafe extern "system" fn target_drag_over(
     let paths = target.paths.lock().unwrap();
     let preferred = DROPEFFECT(target.preferred.load(Ordering::Relaxed));
     let pos = client_position(pt);
-    let dst = resolve_target_dir(pos);
+    let resolved = resolve_drop_target(pos);
     let allowed = unsafe { *effect };
-    let chosen = choose_effect(modifiers, allowed, preferred, &paths, dst.as_deref());
+    let chosen = choose_effect(modifiers, allowed, preferred, &paths, &resolved);
     unsafe { *effect = chosen };
-    *DRAG_HOVER.lock().unwrap() = Some(DragHover { position: pos, target: dst, action: effect_to_action(chosen) });
+    *DRAG_HOVER.lock().unwrap() =
+        Some(DragHover { position: pos, target: resolved.dir_path(), action: effect_to_action(chosen) });
     crate::platform::wake();
     S_OK
 }
@@ -379,9 +446,9 @@ unsafe extern "system" fn target_drop(
     *DRAG_HOVER.lock().unwrap() = None;
 
     let pos = client_position(pt);
-    let dst = resolve_target_dir(pos);
+    let resolved = resolve_drop_target(pos);
     let allowed = unsafe { *effect };
-    let chosen = choose_effect(modifiers, allowed, preferred, &paths, dst.as_deref());
+    let chosen = choose_effect(modifiers, allowed, preferred, &paths, &resolved);
     unsafe { *effect = chosen };
     let Some(action) = effect_to_action(chosen) else {
         crate::platform::wake();
@@ -547,7 +614,12 @@ pub fn drag_out(paths: &[PathBuf]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
+    use windows::Win32::System::Com::{STGMEDIUM_0, TYMED_ISTREAM};
+    use windows::Win32::System::Memory::{GMEM_FIXED, GlobalAlloc};
     use windows::Win32::System::SystemServices::{MK_CONTROL, MK_SHIFT};
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn fixture_files() -> (PathBuf, PathBuf, Vec<PathBuf>) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("tmp").join("dnd-test");
@@ -564,9 +636,12 @@ mod tests {
 
     #[test]
     fn drop_target_respects_ole_allowed_mask_and_modifiers() {
+        let _guard = TEST_LOCK.lock().unwrap();
         unsafe { windows::Win32::System::Ole::OleInitialize(None) }.unwrap();
         let (_src, dst, files) = fixture_files();
+        set_pin_drop_rect(None);
         update_drop_context(&[], Some(dst.clone()));
+        while take_drop().is_some() {}
         let data = data_object(&files).unwrap();
         assert_eq!(object_paths(&data), files);
 
@@ -612,5 +687,122 @@ mod tests {
         assert_eq!(effect, DROPEFFECT_MOVE);
         unsafe { target.DragLeave() }.unwrap();
         assert!(drag_hover().is_none());
+    }
+
+    #[test]
+    fn pin_drop_rect_allows_ancestor_dir_and_rejects_plain_files() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe { windows::Win32::System::Ole::OleInitialize(None) }.unwrap();
+        let (src, _dst, files) = fixture_files();
+        let parent = src.parent().unwrap().to_path_buf();
+        let pin_rect = Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(200.0, 40.0));
+        // Current dir is a descendant of `parent`, which would normally fail `is_self_or_ancestor`.
+        update_drop_context(&[], Some(src.clone()));
+        set_pin_drop_rect(Some(pin_rect));
+        while take_drop().is_some() {}
+
+        let all_allowed = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+        let dir_data = data_object(std::slice::from_ref(&parent)).unwrap();
+        let target = new_target();
+        let inside_pin = POINTL { x: 50, y: 20 };
+
+        // Dragging ancestor folder over pin_drop_rect succeeds with DROPEFFECT_LINK.
+        let mut effect = all_allowed;
+        unsafe { target.DragEnter(&dir_data, MODIFIERKEYS_FLAGS(0), inside_pin, &mut effect) }.unwrap();
+        assert_eq!(effect, DROPEFFECT_LINK);
+        assert!(drag_hover().is_some_and(|h| h.target.is_none() && h.action == Some(DropAction::Link)));
+
+        let mut drop_effect = all_allowed;
+        unsafe { target.Drop(&dir_data, MODIFIERKEYS_FLAGS(0), inside_pin, &mut drop_effect) }.unwrap();
+        assert_eq!(drop_effect, DROPEFFECT_LINK);
+        let ev = take_drop().expect("pin drop should enqueue DropEvent");
+        assert_eq!(ev.paths, vec![parent.clone()]);
+        assert_eq!(ev.action, DropAction::Link);
+
+        // Dragging the same ancestor folder outside pin_drop_rect (onto child `src`) is still rejected!
+        let outside_pin = POINTL { x: 300, y: 300 };
+        let mut effect = all_allowed;
+        unsafe { target.DragEnter(&dir_data, MODIFIERKEYS_FLAGS(0), outside_pin, &mut effect) }.unwrap();
+        assert_eq!(effect, DROPEFFECT_NONE);
+        unsafe { target.DragLeave() }.unwrap();
+
+        // Dragging only non-directory files over pin_drop_rect is disallowed.
+        let file_data = data_object(&files).unwrap();
+        let mut effect = all_allowed;
+        unsafe { target.DragEnter(&file_data, MODIFIERKEYS_FLAGS(0), inside_pin, &mut effect) }.unwrap();
+        assert_eq!(effect, DROPEFFECT_NONE);
+        unsafe { target.DragLeave() }.unwrap();
+
+        set_pin_drop_rect(None);
+    }
+
+    #[test]
+    fn non_filesystem_empty_area_returns_dropeffect_none_while_zone_still_accepts() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe { windows::Win32::System::Ole::OleInitialize(None) }.unwrap();
+        let (_src, dst, files) = fixture_files();
+        let drive_zone = Rect::from_min_max(Pos2::new(20.0, 20.0), Pos2::new(220.0, 60.0));
+        // Simulates `This PC` / Network view: current_dir is None, but drive row has a zone.
+        set_pin_drop_rect(None);
+        update_drop_context(&[(drive_zone, dst.clone())], None);
+        while take_drop().is_some() {}
+
+        let all_allowed = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+        let data = data_object(&files).unwrap();
+        let target = new_target();
+
+        // Empty area outside any zone -> DROPEFFECT_NONE on both DragEnter and Drop.
+        let empty_pt = POINTL { x: 400, y: 400 };
+        let mut effect = all_allowed;
+        unsafe { target.DragEnter(&data, MODIFIERKEYS_FLAGS(0), empty_pt, &mut effect) }.unwrap();
+        assert_eq!(effect, DROPEFFECT_NONE);
+        assert!(drag_hover().is_some_and(|h| h.target.is_none() && h.action.is_none()));
+
+        let mut drop_effect = all_allowed;
+        unsafe { target.Drop(&data, MODIFIERKEYS_FLAGS(0), empty_pt, &mut drop_effect) }.unwrap();
+        assert_eq!(drop_effect, DROPEFFECT_NONE);
+        assert!(take_drop().is_none());
+
+        // Inside the drive zone -> allowed!
+        let zone_pt = POINTL { x: 80, y: 40 };
+        let mut effect = all_allowed;
+        unsafe { target.DragEnter(&data, MODIFIERKEYS_FLAGS(0), zone_pt, &mut effect) }.unwrap();
+        assert_eq!(effect, DROPEFFECT_MOVE);
+        assert!(drag_hover().is_some_and(|h| h.target.as_deref() == Some(dst.as_path())));
+        unsafe { target.DragLeave() }.unwrap();
+    }
+
+    #[test]
+    fn preferred_effect_validates_tymed_and_hglobal_size() {
+        // Non-HGLOBAL tymed must be ignored safely.
+        let bad_tymed = STGMEDIUM {
+            tymed: TYMED_ISTREAM.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: HGLOBAL(std::ptr::null_mut()) },
+            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        };
+        assert_eq!(unsafe { read_preferred_effect_medium(&bad_tymed) }, DROPEFFECT_NONE);
+
+        // Undersized HGLOBAL (< 4 bytes) must return DROPEFFECT_NONE without out-of-bounds read.
+        let tiny = unsafe { GlobalAlloc(GMEM_FIXED, 2) }.unwrap();
+        let tiny_med = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: tiny },
+            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        };
+        assert_eq!(unsafe { read_preferred_effect_medium(&tiny_med) }, DROPEFFECT_NONE);
+        let _ = unsafe { GlobalFree(Some(tiny)) };
+
+        // Valid 4-byte HGLOBAL returns the stored DROPEFFECT.
+        let valid = unsafe { GlobalAlloc(GMEM_FIXED, std::mem::size_of::<u32>()) }.unwrap();
+        unsafe {
+            *(valid.0 as *mut u32) = DROPEFFECT_COPY.0;
+        }
+        let valid_med = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: valid },
+            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        };
+        assert_eq!(unsafe { read_preferred_effect_medium(&valid_med) }, DROPEFFECT_COPY);
+        let _ = unsafe { GlobalFree(Some(valid)) };
     }
 }
