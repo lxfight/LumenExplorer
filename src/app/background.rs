@@ -234,6 +234,22 @@ impl LumenApp {
 
     fn apply_op_finished(&mut self, finished: crate::shell::op_worker::OpFinished) {
         match finished.result {
+            Ok(OpResult::Restored { items, result }) => {
+                self.restore_pending = false;
+                match result {
+                    Ok(count) => self.toast(format!("已从回收站还原 {count} 个项目")),
+                    Err(err) => {
+                        // A new operation may have completed while restore ran.
+                        // Retain the failed undo without discarding newer history.
+                        if self.undo_stack.len() >= 64 {
+                            self.undo_stack.remove(0);
+                        }
+                        self.undo_stack.push(UndoEntry::Deleted { items });
+                        self.toast_error(err);
+                    }
+                }
+                self.reload_active();
+            }
             Ok(OpResult::Copied { pairs }) => {
                 let count = pairs.len();
                 if count > 0 {
@@ -258,14 +274,17 @@ impl LumenApp {
             }
             Ok(OpResult::Deleted { items, permanent, count }) => {
                 if count > 0 {
+                    let can_restore = !permanent && !items.is_empty();
                     if !permanent && !items.is_empty() {
                         self.push_undo(UndoEntry::Deleted { items });
                     }
                     self.reload_active();
                     self.toast(if permanent {
                         format!("已永久删除 {count} 个项目")
-                    } else {
+                    } else if can_restore {
                         format!("已将 {count} 个项目移到回收站（Ctrl+Z 可还原）")
+                    } else {
+                        format!("已删除 {count} 个项目，无法从回收站还原")
                     });
                 }
             }

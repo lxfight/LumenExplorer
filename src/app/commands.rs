@@ -537,6 +537,10 @@ impl LumenApp {
     }
 
     pub(crate) fn undo(&mut self) {
+        if self.restore_pending {
+            self.toast("正在还原，请稍后再撤销");
+            return;
+        }
         let Some(entry) = self.undo_stack.pop() else {
             self.toast("没有可撤销的操作");
             return;
@@ -571,17 +575,18 @@ impl LumenApp {
                     self.op_worker.submit(OpRequest::Move { items, dest_dir, clear_clipboard: false });
                 }
             }
-            UndoEntry::Deleted { items } => match crate::shell::ops::restore_from_recycle_bin(&items) {
-                Ok(count) => {
-                    self.toast(format!("已从回收站还原 {count} 个项目"));
-                    self.reload_active();
-                }
-                Err(err) => self.toast_error(format!("{err:#}")),
-            },
+            UndoEntry::Deleted { items } => {
+                self.restore_pending = true;
+                self.op_worker.submit(OpRequest::Restore { items });
+            }
         }
     }
 
     pub(crate) fn redo(&mut self) {
+        if self.restore_pending {
+            self.toast("正在还原，请稍后再重做");
+            return;
+        }
         let Some(entry) = self.redo_stack.pop() else {
             self.toast("没有可重做的操作");
             return;

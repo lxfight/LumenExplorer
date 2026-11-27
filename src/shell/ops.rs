@@ -14,16 +14,15 @@ use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, IBindCtx, IDataO
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    BHID_SFUIObject, CMINVOKECOMMANDINFOEX, FOLDERID_RecycleBinFolder, IContextMenu, ILFindLastID, ILFree,
-    IShellItemArray, IShellLinkW, OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OPENASINFO, SHCreateDataObject,
-    SHCreateShellItemArrayFromIDLists, SHEmptyRecycleBinW, SHMultiFileProperties, SHOP_FILEPATH, SHObjectProperties,
-    SHOpenWithDialog, SHParseDisplayName, ShellExecuteW, ShellLink,
+    BHID_SFUIObject, CMINVOKECOMMANDINFOEX, FOF_ALLOWUNDO, FileOperation, IContextMenu, IFileOperation,
+    IFileOperationProgressSink, ILFindLastID, ILFree, IShellItem, IShellItemArray, IShellLinkW,
+    OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OPENASINFO, SHCreateDataObject, SHCreateItemFromIDList,
+    SHCreateItemFromParsingName, SHCreateShellItemArrayFromIDLists, SHEmptyRecycleBinW, SHMultiFileProperties,
+    SHOP_FILEPATH, SHObjectProperties, SHOpenWithDialog, SHParseDisplayName, ShellExecuteW, ShellLink,
 };
 #[cfg(test)]
 use windows::Win32::UI::Shell::{
-    FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING,
-    FOFX_RECYCLEONDELETE, FileOperation, IFileOperation, IFileOperationProgressSink, IShellItem,
-    SHCreateItemFromParsingName,
+    FILEOPERATION_FLAGS, FOF_NOCONFIRMATION, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING, FOFX_RECYCLEONDELETE,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, Interface, PCSTR, PCWSTR};
@@ -193,30 +192,31 @@ pub fn eject_drive(root: &Path) -> anyhow::Result<()> {
     invoke_pidl_verb(&[std::sync::Arc::new(pidl)], "eject")
 }
 
-/// Restores recently deleted paths from the Windows Recycle Bin by matching
-/// filenames in `FOLDERID_RecycleBinFolder` and invoking the `"undelete"` verb.
-pub fn restore_from_recycle_bin(original_paths: &[PathBuf]) -> anyhow::Result<usize> {
-    if original_paths.is_empty() {
+/// Restores only the recycled Shell items captured by the delete operation.
+pub fn restore_from_recycle_bin(items: &[crate::shell::op_worker::RecycledItem]) -> anyhow::Result<usize> {
+    if items.is_empty() {
         return Ok(0);
     }
-    let bin = crate::shell::location::Location::known(&FOLDERID_RecycleBinFolder)?;
-    let entries = crate::shell::enumerate::list_shell(&bin, true)?;
-    let wanted: Vec<String> =
-        original_paths.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase())).collect();
-    let mut to_restore = Vec::new();
-    for entry in entries {
-        if let Some(pidl) = entry.pidl
-            && wanted.iter().any(|w| entry.name.to_ascii_lowercase() == *w)
-        {
-            to_restore.push(pidl);
-        }
+    let op: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) }?;
+    unsafe { op.SetOperationFlags(FOF_ALLOWUNDO) }?;
+    let hwnd = crate::platform::hwnd();
+    if !hwnd.0.is_null() {
+        unsafe { op.SetOwnerWindow(hwnd) }?;
     }
-    if to_restore.is_empty() {
-        return Err(anyhow!("回收站中未找到可还原的项目"));
+    for item in items {
+        let parent = item.original.parent().ok_or_else(|| anyhow!("无法确定还原目录"))?;
+        let name = item.original.file_name().ok_or_else(|| anyhow!("无法确定还原文件名"))?;
+        let pidl = crate::shell::Pidl::from_bytes(&item.pidl).ok_or_else(|| anyhow!("回收站项目标识无效"))?;
+        let source: IShellItem = unsafe { SHCreateItemFromIDList(pidl.as_ptr()) }?;
+        let destination: IShellItem =
+            unsafe { SHCreateItemFromParsingName(&HSTRING::from(parent), None::<&IBindCtx>) }?;
+        unsafe { op.MoveItem(&source, &destination, &HSTRING::from(name), None::<&IFileOperationProgressSink>) }?;
     }
-    let count = to_restore.len();
-    invoke_pidl_verb(&to_restore, "undelete")?;
-    Ok(count)
+    unsafe { op.PerformOperations() }?;
+    if unsafe { op.GetAnyOperationsAborted() }?.as_bool() {
+        return Err(anyhow!("还原已取消，可再次按 Ctrl+Z 重试"));
+    }
+    Ok(items.len())
 }
 
 /// Creates a Windows `.lnk` shortcut pointing to `target` inside `dest_dir`.

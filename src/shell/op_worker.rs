@@ -19,7 +19,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::{
     FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING,
     FOFX_RECYCLEONDELETE, FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Vtbl,
-    IShellItem, SHCreateItemFromParsingName,
+    IShellItem, SHCreateItemFromParsingName, SHGetIDListFromObject,
 };
 use windows::core::{GUID, HRESULT, HSTRING, IUnknown, IUnknown_Vtbl, Interface, PCWSTR};
 
@@ -31,6 +31,7 @@ pub enum OpRequest {
     Move { items: Vec<PathBuf>, dest_dir: PathBuf, clear_clipboard: bool },
     Delete { items: Vec<PathBuf>, permanent: bool },
     DeleteDirect { items: Vec<PathBuf> },
+    Restore { items: Vec<RecycledItem> },
     Rename { from: PathBuf, new_name: String, is_undo: bool },
     NewFolder { parent: PathBuf, name: String },
     CreateShortcut { items: Vec<PathBuf>, dest_dir: PathBuf },
@@ -47,11 +48,19 @@ pub struct OpProgress {
 pub enum OpResult {
     Copied { pairs: Vec<(PathBuf, PathBuf)> },
     Moved { pairs: Vec<(PathBuf, PathBuf)>, clear_clipboard: bool },
-    Deleted { items: Vec<PathBuf>, permanent: bool, count: usize },
+    Deleted { items: Vec<RecycledItem>, permanent: bool, count: usize },
     DeletedDirect { count: usize },
+    Restored { items: Vec<RecycledItem>, result: Result<usize, String> },
     Renamed { from: PathBuf, to: PathBuf, is_undo: bool },
     CreatedFolder { path: PathBuf, name: String },
     CreatedShortcuts { paths: Vec<PathBuf> },
+}
+
+/// Exact Shell identity of a recycled item, serialized for use in another STA.
+#[derive(Clone, Debug)]
+pub struct RecycledItem {
+    pub original: PathBuf,
+    pub pidl: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +159,7 @@ fn req_label(req: &OpRequest) -> String {
             }
         }
         OpRequest::DeleteDirect { items } => format!("正在撤销 {} 个项目…", items.len()),
+        OpRequest::Restore { items } => format!("正在还原 {} 个项目…", items.len()),
         OpRequest::Rename { new_name, .. } => format!("正在重命名为 {new_name}…"),
         OpRequest::NewFolder { name, .. } => format!("正在新建 {name}…"),
         OpRequest::CreateShortcut { items, .. } => format!("正在创建 {} 个快捷方式…", items.len()),
@@ -162,6 +172,8 @@ struct SinkData {
     progress: Arc<Mutex<OpProgress>>,
     landed_pairs: Mutex<Vec<(PathBuf, PathBuf)>>,
     deleted: Mutex<Vec<PathBuf>>,
+    deleting: Mutex<std::collections::HashMap<usize, PathBuf>>,
+    recycled: Mutex<Vec<RecycledItem>>,
 }
 
 #[repr(C)]
@@ -279,7 +291,13 @@ unsafe extern "system" fn sink_post_copy(
     S_OK
 }
 
-unsafe extern "system" fn sink_pre_delete(_this: *mut c_void, _flags: u32, _item: *mut c_void) -> HRESULT {
+unsafe extern "system" fn sink_pre_delete(this: *mut c_void, _flags: u32, item: *mut c_void) -> HRESULT {
+    let obj = unsafe { &*(this as *const SinkObject) };
+    if let Some(path) = unsafe { IShellItem::from_raw_borrowed(&item) }.and_then(item_path)
+        && let Ok(mut deleting) = obj.data.deleting.lock()
+    {
+        deleting.insert(item as usize, path);
+    }
     S_OK
 }
 
@@ -288,14 +306,23 @@ unsafe extern "system" fn sink_post_delete(
     _flags: u32,
     item: *mut c_void,
     hr: HRESULT,
-    _newly: *mut c_void,
+    newly: *mut c_void,
 ) -> HRESULT {
-    if hr.is_ok() {
-        let obj = unsafe { &*(this as *const SinkObject) };
-        if let Some(src) = unsafe { IShellItem::from_raw_borrowed(&item) }.and_then(item_path)
-            && let Ok(mut list) = obj.data.deleted.lock()
+    let obj = unsafe { &*(this as *const SinkObject) };
+    let original = obj.data.deleting.lock().ok().and_then(|mut items| items.remove(&(item as usize)));
+    if hr.is_ok()
+        && let Some(src) = original.or_else(|| unsafe { IShellItem::from_raw_borrowed(&item) }.and_then(item_path))
+        && !src.exists()
+        && let Ok(mut list) = obj.data.deleted.lock()
+    {
+        list.push(src.clone());
+        if let Some(recycled) = unsafe { IShellItem::from_raw_borrowed(&newly) }
+            && let Ok(raw) = unsafe { SHGetIDListFromObject(recycled) }
         {
-            list.push(src);
+            let pidl = crate::shell::Pidl::from_raw(raw);
+            if let Ok(mut items) = obj.data.recycled.lock() {
+                items.push(RecycledItem { original: src, pidl: pidl.to_bytes() });
+            }
         }
     }
     S_OK
@@ -377,7 +404,13 @@ static SINK_VTABLE: IFileOperationProgressSink_Vtbl = IFileOperationProgressSink
 };
 
 fn new_sink(progress: Arc<Mutex<OpProgress>>) -> (IFileOperationProgressSink, Arc<SinkData>) {
-    let data = Arc::new(SinkData { progress, landed_pairs: Mutex::new(Vec::new()), deleted: Mutex::new(Vec::new()) });
+    let data = Arc::new(SinkData {
+        progress,
+        landed_pairs: Mutex::new(Vec::new()),
+        deleted: Mutex::new(Vec::new()),
+        deleting: Mutex::new(std::collections::HashMap::new()),
+        recycled: Mutex::new(Vec::new()),
+    });
     let obj = Box::new(SinkObject { vtable: &SINK_VTABLE, refs: AtomicU32::new(1), data: data.clone() });
     let sink = unsafe { IFileOperationProgressSink::from_raw(Box::into_raw(obj).cast::<c_void>()) };
     (sink, data)
@@ -404,6 +437,10 @@ fn shell_item(path: &Path) -> anyhow::Result<IShellItem> {
 fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Result<OpResult> {
     let (sink, data) = new_sink(progress.clone());
     match req {
+        OpRequest::Restore { items } => {
+            let result = crate::shell::ops::restore_from_recycle_bin(&items).map_err(|err| format!("{err:#}"));
+            Ok(OpResult::Restored { items, result })
+        }
         OpRequest::Copy { items, dest_dir } => {
             let same_dir = items
                 .iter()
@@ -448,9 +485,9 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             let res = unsafe { op.PerformOperations() };
             let _ = unsafe { op.Unadvise(cookie) };
             res?;
-            let deleted = data.deleted.lock().unwrap().clone();
-            let count = deleted.len();
-            Ok(OpResult::Deleted { items: deleted, permanent, count })
+            let count = data.deleted.lock().unwrap().len();
+            let items = data.recycled.lock().unwrap().clone();
+            Ok(OpResult::Deleted { items, permanent, count })
         }
         OpRequest::DeleteDirect { items } => {
             let (op, cookie) = create_op(FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING, &sink)?;
@@ -512,5 +549,43 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             }
             Ok(OpResult::CreatedShortcuts { paths })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleted_items_restore_to_their_exact_original_paths() {
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok().expect("COM STA");
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("tmp").join(format!("undo-delete-{stamp}"));
+        let first = root.join("first").join(format!("lumen-undo-{stamp}.txt"));
+        let second = root.join("second").join(first.file_name().unwrap());
+        for (path, contents) in [(&first, b"first".as_slice()), (&second, b"second".as_slice())] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let progress = Arc::new(Mutex::new(OpProgress { label: String::new(), percent: 0, active_jobs: 0 }));
+        let delete = |path: &PathBuf| {
+            let result = run_request(OpRequest::Delete { items: vec![path.clone()], permanent: false }, &progress)
+                .expect("delete through worker");
+            let OpResult::Deleted { items, count, .. } = result else { panic!("expected delete result") };
+            assert_eq!(count, 1);
+            assert_eq!(items.len(), 1);
+            assert!(!path.exists());
+            items
+        };
+        let first_deleted = delete(&first);
+        let second_deleted = delete(&second);
+        assert_eq!(crate::shell::ops::restore_from_recycle_bin(&first_deleted).expect("restore first"), 1);
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert!(!second.exists(), "restoring one delete must leave the other same-name item in the bin");
+        assert_eq!(crate::shell::ops::restore_from_recycle_bin(&second_deleted).expect("restore second"), 1);
+        assert_eq!(std::fs::read(&second).unwrap(), b"second");
+        std::fs::remove_dir_all(root).unwrap();
+        unsafe { CoUninitialize() };
     }
 }

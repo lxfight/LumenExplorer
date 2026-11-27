@@ -539,10 +539,9 @@ impl LumenApp {
         let mut row_rects: Vec<(usize, Rect)> = Vec::new();
 
         let generation = self.tab_ref(secondary).generation;
+        let enter_id = crate::ui::spring::generation_id(&ctx, egui::Id::unique(("pane-enter", pane_tag)), generation);
         // Crisp 120ms cubic ease-out micro-glide on folder entry (zero overshoot).
-        let enter_offset = (1.0
-            - crate::ui::spring::ease_out_reveal(&ctx, egui::Id::unique(("pane-enter", pane_tag, generation)), 0.12))
-            * 5.0;
+        let enter_offset = (1.0 - crate::ui::spring::ease_out_reveal(&ctx, enter_id, 0.12)) * 5.0;
         let single_selected = self.tab_ref(secondary).selection.len() == 1;
         let mut single_sel_row_y: Option<f32> = None;
         let mut single_sel_row_left: f32 = rows_area.left() + 5.0;
@@ -817,7 +816,7 @@ impl LumenApp {
         if let Some(target_cy) = single_sel_row_y {
             let (cy, vy) = crate::ui::spring::animate_vel(
                 &ctx,
-                egui::Id::unique(("details-sel-bar-y", pane_tag, generation)),
+                crate::ui::spring::generation_id(&ctx, egui::Id::unique(("details-sel-bar-y", pane_tag)), generation),
                 target_cy,
                 target_cy,
                 crate::ui::spring::MAGNETIC,
@@ -1367,7 +1366,8 @@ impl LumenApp {
         let ctx = ui.ctx().clone();
         let pane_tag = u8::from(secondary);
         let generation = self.tab_ref(secondary).generation;
-        let scroll_spring_id = egui::Id::unique(("list-scroll-spring", pane_tag, generation));
+        let scroll_spring_id =
+            crate::ui::spring::generation_id(&ctx, egui::Id::unique(("list-scroll-spring", pane_tag)), generation);
         let mut immediate_scroll = false;
         let max_scroll = (content_h - area.height()).max(0.0);
         let mut target = self.tab_ref(secondary).scroll_offset.clamp(0.0, max_scroll);

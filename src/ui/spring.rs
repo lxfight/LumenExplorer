@@ -143,6 +143,23 @@ pub fn clear(ctx: &egui::Context, id: egui::Id) {
     });
 }
 
+/// Reuses one animation slot, resetting it when the folder generation changes.
+/// Including the generation in the animation ID would retain every old state.
+pub fn generation_id(ctx: &egui::Context, id: egui::Id, generation: u64) -> egui::Id {
+    let generation_id = id.with("generation");
+    let changed = ctx.data_mut(|d| {
+        let changed = d.get_temp::<u64>(generation_id) != Some(generation);
+        if changed {
+            d.insert_temp(generation_id, generation);
+        }
+        changed
+    });
+    if changed {
+        clear(ctx, id);
+    }
+    id
+}
+
 /// Scales `rect` around `origin` by `scale`.
 pub fn scale_rect_around(rect: Rect, origin: Pos2, scale: f32) -> Rect {
     let min = origin + (rect.min - origin) * scale;
@@ -170,6 +187,24 @@ pub fn slide_y(rect: Rect, dy: f32) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generations_reset_animation_without_retaining_old_states() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("generation-test");
+        for generation in 0..10_000 {
+            let slot = generation_id(&ctx, id, generation);
+            assert_eq!(slot, id);
+            assert!(ctx.data(|d| d.get_temp::<SpringState>(slot)).is_none());
+            assert!(ctx.data(|d| d.get_temp::<RevealState>(slot)).is_none());
+            set_immediate(&ctx, slot, 42.0);
+            ctx.data_mut(|d| d.insert_temp(slot, RevealState { elapsed: 0.05 }));
+            generation_id(&ctx, id, generation);
+            assert_eq!(ctx.data(|d| d.get_temp::<SpringState>(slot)).unwrap().value, 42.0);
+            assert_eq!(ctx.data(|d| d.get_temp::<RevealState>(slot)).unwrap().elapsed, 0.05);
+            assert_eq!(ctx.data(|d| d.len()), 3);
+        }
+    }
 
     #[test]
     fn jelly_overshoots_while_panel_stays_critically_damped() {

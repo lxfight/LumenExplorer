@@ -104,7 +104,7 @@ fn replace_clipboard(entries: &[(u32, Vec<u8>)]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8> {
+pub(super) fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8> {
     let mut units: Vec<u16> = Vec::new();
     for path in paths {
         units.extend(path.as_os_str().encode_wide());
@@ -184,6 +184,15 @@ pub fn set_text(text: &str) -> anyhow::Result<()> {
 
 /// Reads plain Unicode text from the clipboard (capped to 1024 chars for quick path sensing).
 pub fn get_text() -> Option<String> {
+    read_text(1024)
+}
+
+/// TextEdit must receive the full text; path sensing intentionally reads less.
+pub fn get_text_for_paste() -> Option<String> {
+    read_text(usize::MAX)
+}
+
+fn read_text(limit: usize) -> Option<String> {
     if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32) }.is_err() {
         return None;
     }
@@ -198,7 +207,7 @@ pub fn get_text() -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    let max_units = (bytes / 2).min(1024);
+    let max_units = (bytes / 2).min(limit);
     let slice = unsafe { std::slice::from_raw_parts(ptr, max_units) };
     let len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
     let text = String::from_utf16_lossy(&slice[..len]);

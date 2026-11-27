@@ -544,7 +544,7 @@ impl LumenApp {
         let selected = self.active().selection.len();
         let has_sel = selected > 0;
         let actions: [(&str, &str, bool, Command); 5] = [
-            (icons::DELETE, "删除  Del", has_sel, Command::Delete),
+            (icons::DELETE, "删除  Del / Ctrl+D", has_sel, Command::Delete),
             (icons::RENAME, "重命名  F2", selected == 1, Command::Rename),
             (icons::PASTE, "粘贴  Ctrl+V", self.clipboard_files, Command::Paste),
             (icons::COPY, "复制  Ctrl+C", has_sel, Command::Copy),
@@ -561,10 +561,10 @@ impl LumenApp {
         widgets::separator_v(&painter, right - 3.0, cy, 20.0, t.divider);
         right -= 10.0;
 
-        // New button: click creates a folder, the shortcut hint mentions it.
+        // Use the same document templates as the background context menu.
         let can_new = self.current_dir().is_some();
-        let new_rect = Rect::from_center_size(Pos2::new(right - 33.0, cy), Vec2::new(62.0, command_h));
-        right -= 70.0;
+        let new_rect = Rect::from_center_size(Pos2::new(right - 40.0, cy), Vec2::new(76.0, command_h));
+        right -= 84.0;
         let new_id = egui::Id::unique("cmd-new");
         let new_resp = ui.interact(new_rect, new_id, Sense::click());
         let new_hover = widgets::hover_t(&ctx, new_id, new_resp.hovered() && can_new);
@@ -585,10 +585,12 @@ impl LumenApp {
         if can_new && new_resp.hovered() {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        let new_resp =
-            if new_resp.hovered() { new_resp.on_hover_text("新建文件夹  Ctrl+Shift+N") } else { new_resp };
+        let new_resp = if new_resp.hovered() { new_resp.on_hover_text("新建文件夹或文档") } else { new_resp };
+        widgets::icon_at(&painter, Pos2::new(new_rect.right() - 9.0, cy), icons::CHEVRON_DOWN, 8.0, new_color);
         if can_new && new_resp.clicked() {
-            self.command(Command::NewFolder);
+            self.menu_anchor = None;
+            self.crumb_menu = None;
+            self.ctx_menu = Some(crate::ui::context_menu::ContextMenuState::open_new(self, new_rect.left_bottom()));
         }
         widgets::separator_v(&painter, right - 4.0, cy, 20.0, t.divider);
         right -= 10.0;

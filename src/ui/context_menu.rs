@@ -26,6 +26,7 @@ const ACTION_BAR_H: f32 = 40.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextKind {
+    New,
     Items,
     Background,
     RecycleBinItems,
@@ -55,6 +56,12 @@ pub(crate) struct ContextMenuState {
 }
 
 impl ContextMenuState {
+    pub fn open_new(app: &LumenApp, anchor: Pos2) -> Self {
+        let mut state = Self::open(app, anchor);
+        state.kind = ContextKind::New;
+        state
+    }
+
     pub fn open(app: &LumenApp, anchor: Pos2) -> Self {
         let tab = app.active();
         let is_recycle = tab.location.path.is_none()
@@ -196,7 +203,7 @@ impl LumenApp {
                     (icons::COPY, "复制 (Ctrl+C)", Command::Copy, true),
                     (icons::RENAME, "重命名 (F2)", Command::Rename, true),
                     (icons::LINK, "复制路径 (Ctrl+Shift+C)", Command::CopyPath, true),
-                    (icons::DELETE, "删除 (Del)", Command::Delete, true),
+                    (icons::DELETE, "删除 (Del / Ctrl+D)", Command::Delete, true),
                 ],
                 _ => vec![
                     (
@@ -358,8 +365,11 @@ impl LumenApp {
         }
 
         // ---- Cascading submenu ----------------------------------------------
+        // Submenus extend outside the animated clip of the parent menu.
+        let submenu_painter = ui.painter().clone();
         if let Some(sub) = state.open_sub
-            && let Some(sub_action) = self.paint_context_submenu(ui, &painter, &t, rect, state.sub_anchor_y, full, sub)
+            && let Some(sub_action) =
+                self.paint_context_submenu(ui, &submenu_painter, &t, rect, state.sub_anchor_y, full, sub)
         {
             chosen = Some(sub_action);
         }
@@ -387,12 +397,7 @@ impl LumenApp {
         let mut entries: Vec<(bool, &str, String, CtxAction)> = Vec::new();
         match kind {
             SubmenuKind::New => {
-                entries.push((false, icons::FOLDER_NEW, "文件夹".into(), CtxAction::Cmd(Command::NewFolder)));
-                entries.push((false, icons::FILE, "文本文档 (.txt)".into(), CtxAction::Cmd(Command::NewFile)));
-                for tpl in shellnew::templates() {
-                    let label = format!("{} (.{})", tpl.label, tpl.ext);
-                    entries.push((false, icons::FILE, label, CtxAction::NewTemplate(tpl)));
-                }
+                entries = new_entries();
             }
             SubmenuKind::View => {
                 let cur = self.active().view;
@@ -522,9 +527,29 @@ impl LumenApp {
     }
 }
 
+fn new_entries() -> Vec<(bool, &'static str, String, CtxAction)> {
+    let mut entries = vec![
+        (false, icons::FOLDER_NEW, "文件夹".into(), CtxAction::Cmd(Command::NewFolder)),
+        (false, icons::FILE, "文本文档 (.txt)".into(), CtxAction::Cmd(Command::NewFile)),
+    ];
+    for tpl in shellnew::templates() {
+        entries.push((false, icons::FILE, format!("{} (.{})", tpl.label, tpl.ext), CtxAction::NewTemplate(tpl)));
+    }
+    entries
+}
+
 fn build_rows(state: &ContextMenuState) -> Vec<CtxRow> {
     let mut rows = Vec::new();
     match state.kind {
+        ContextKind::New => {
+            rows.extend(new_entries().into_iter().map(|(_, glyph, label, action)| CtxRow::Item {
+                glyph,
+                label,
+                shortcut: None,
+                action,
+                enabled: true,
+            }));
+        }
         ContextKind::Items => {
             rows.push(CtxRow::Item {
                 glyph: icons::OPEN_EXTERNAL,
@@ -715,4 +740,97 @@ fn build_rows(state: &ContextMenuState) -> Vec<CtxRow> {
         }
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::settings::Settings;
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+
+    fn paint(app: &mut LumenApp, ctx: &egui::Context, time: f64, events: Vec<egui::Event>) -> egui::FullOutput {
+        let full = Rect::from_min_size(Pos2::ZERO, Vec2::new(820.0, 600.0));
+        let input = egui::RawInput { screen_rect: Some(full), time: Some(time), events, ..Default::default() };
+        let mut output = ctx.run_pass(input, |ctx| {
+            let mut ui =
+                egui::Ui::new(ctx.clone(), egui::Id::unique("submenu-test"), egui::UiBuilder::new().max_rect(full));
+            app.paint_context_menu(&mut ui, full);
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    #[test]
+    fn cascading_menus_are_visible_on_both_sides_and_new_document_is_clickable() {
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok().unwrap();
+        let ctx = egui::Context::default();
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("tmp")
+            .join(format!("submenu-{stamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = Settings { tabs: vec![root.to_string_lossy().into_owned()], ..Default::default() };
+        let mut app = LumenApp::with_context(&ctx, settings);
+        for x in [60.0, 600.0] {
+            for kind in [SubmenuKind::New, SubmenuKind::View, SubmenuKind::Sort] {
+                let mut state = ContextMenuState::open(&app, Pos2::new(x, 80.0));
+                state.open_sub = Some(kind);
+                state.sub_anchor_y = 180.0;
+                app.ctx_menu = Some(state);
+                paint(&mut app, &ctx, 1.0, Vec::new());
+                let output = paint(&mut app, &ctx, 2.0, Vec::new());
+                let surface = output
+                    .shapes
+                    .iter()
+                    .find_map(|clipped| {
+                        if let egui::Shape::Rect(shape) = &clipped.shape
+                            && (shape.rect.width() - SUB_W).abs() < 0.01
+                            && shape.fill == app.theme.popup
+                        {
+                            Some((clipped.clip_rect, shape.rect))
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("submenu surface must be painted");
+                assert!(surface.0.contains_rect(surface.1), "submenu must not inherit the parent menu's clip");
+            }
+        }
+
+        let mut state = ContextMenuState::open(&app, Pos2::new(60.0, 80.0));
+        state.open_sub = Some(SubmenuKind::New);
+        state.sub_anchor_y = 8.0;
+        app.ctx_menu = Some(state);
+        paint(&mut app, &ctx, 2.5, Vec::new());
+        let point = Pos2::new(60.0 + MENU_W + 40.0, 8.0 + 6.0 + ROW_H * 1.5);
+        paint(&mut app, &ctx, 3.0, vec![egui::Event::PointerMoved(point)]);
+        paint(
+            &mut app,
+            &ctx,
+            3.01,
+            vec![egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        paint(
+            &mut app,
+            &ctx,
+            3.02,
+            vec![egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(root.join("新建文本文档.txt").is_file(), "clicking the submenu must create the selected file type");
+        assert!(app.ctx_menu.is_none());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+        unsafe { CoUninitialize() };
+    }
 }
