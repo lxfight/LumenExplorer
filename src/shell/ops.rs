@@ -155,9 +155,19 @@ pub fn run_as_admin(item: &Path) -> anyhow::Result<()> {
     shell_execute("runas", item)
 }
 
-pub fn empty_recycle_bin() -> anyhow::Result<()> {
-    unsafe { SHEmptyRecycleBinW(Some(crate::platform::hwnd()), PCWSTR::null(), 0) }
-        .map_err(|e| anyhow!("清空回收站失败: {e}"))
+pub fn empty_recycle_bin() -> anyhow::Result<bool> {
+    match unsafe { SHEmptyRecycleBinW(Some(crate::platform::hwnd()), PCWSTR::null(), 0) } {
+        Ok(()) => Ok(true),
+        Err(e) if is_user_cancelled_hr(e.code().0 as u32) => Ok(false),
+        Err(e) => Err(anyhow!("清空回收站失败: {e}")),
+    }
+}
+
+/// True for standard Windows Shell user-cancellation HRESULTs (`ERROR_CANCELLED`,
+/// `COPYENGINE_E_USER_CANCELLED`, or `E_UNEXPECTED` returned by `SHEmptyRecycleBinW`
+/// when the user dismisses the confirmation dialog).
+pub fn is_user_cancelled_hr(code: u32) -> bool {
+    matches!(code, 0x8027_0000 | 0x8007_04C7 | 0x8000_FFFF)
 }
 
 /// Invokes a shell canonical verb (e.g. `"undelete"`, `"eject"`, `"properties"`,
@@ -600,5 +610,56 @@ mod tests {
         assert!(link.exists());
         assert_eq!(link.extension().and_then(|e| e.to_str()), Some("lnk"));
         std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_from_recycle_bin_only_restores_matching_directory() {
+        let _com = ComApartment::init();
+        let root = temp_dir("recycle-restore");
+        let dir_a = root.join("dir_a");
+        let dir_b = root.join("dir_b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let file_a = new_file(&dir_a, "same_name.txt", b"from-a").unwrap();
+        let file_b = new_file(&dir_b, "same_name.txt", b"from-b").unwrap();
+
+        let worker = crate::shell::op_worker::OpWorker::new();
+        let recycle = |path: &PathBuf| {
+            use crate::shell::op_worker::{OpRequest, OpResult};
+            worker.submit(OpRequest::Delete { items: vec![path.clone()], permanent: false });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(finished) = worker.poll().into_iter().next() {
+                    let OpResult::Deleted { items, count, .. } = finished.result.unwrap() else {
+                        panic!("expected delete result")
+                    };
+                    assert_eq!(count, 1);
+                    return items;
+                }
+                assert!(std::time::Instant::now() < deadline, "delete timed out");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let recycled_a = recycle(&file_a);
+        let recycled_b = recycle(&file_b);
+        assert!(!file_a.exists() && !file_b.exists());
+
+        // Restore ONLY dir_b/same_name.txt — dir_a/same_name.txt must NOT be restored!
+        let restored = restore_from_recycle_bin(&recycled_b).expect("restore dir_b");
+        assert_eq!(restored, 1);
+        assert!(file_b.exists(), "expected dir_b/same_name.txt to be restored");
+        assert_eq!(std::fs::read(&file_b).unwrap(), b"from-b");
+        assert!(!file_a.exists(), "unrelated dir_a/same_name.txt must stay in Recycle Bin");
+
+        // Restore dir_a/same_name.txt too so we don't leave test junk in the Recycle Bin.
+        let restored_a = restore_from_recycle_bin(&recycled_a).expect("restore dir_a");
+        assert_eq!(restored_a, 1);
+        assert!(file_a.exists());
+        assert_eq!(std::fs::read(&file_a).unwrap(), b"from-a");
+
+        // Clean up permanently.
+        let _ = delete_direct(&[file_a, file_b]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

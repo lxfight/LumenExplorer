@@ -1,8 +1,8 @@
 [package]
 name = "lumen"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "A high-fidelity Windows 11 file explorer written in Rust"
+description = "A modern, high-speed file workbench for Windows 11 written in Rust"
 license = "MIT"
 repository = "https://github.com/lxfight/LumenExplorer"
 keywords = ["file-manager", "explorer", "windows", "egui", "shell"]
@@ -45,6 +45,7 @@ windows = { version = "0.62", features = [
   "Win32_Security",
   "Win32_Globalization",
   "Win32_System_Pipes",
+  "Win32_Networking_WinHttp",
 ] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff"] }
 serde = { version = "1", features = ["derive"] }

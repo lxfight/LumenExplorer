@@ -19,16 +19,31 @@ pub fn galley_at(painter: &Painter, pos: Pos2, galley: Arc<Galley>, color: Color
 }
 
 pub fn galley(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<Galley> {
-    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat { font_id: font, color, ..Default::default() });
-    job.wrap = TextWrapping { max_width: max_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-    ui.ctx().fonts_mut(|f| f.layout_job(job))
+    layout_wrap(ui.ctx(), text, font, color, max_w, 1)
 }
 
-/// Like [`galley`] but allows wrapping over `max_rows` lines (used for paths).
+/// Like [`galley`] but wraps over at most `max_rows` lines with ellipsis truncation.
 pub fn galley_wrap(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32, max_rows: usize) -> Arc<Galley> {
+    layout_wrap(ui.ctx(), text, font, color, max_w, max_rows)
+}
+
+/// Context-level multi-line wrapped text layout helper with ellipsis truncation.
+pub fn layout_wrap(
+    ctx: &egui::Context,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_w: f32,
+    max_rows: usize,
+) -> Arc<Galley> {
     let mut job = LayoutJob::single_section(text.to_owned(), TextFormat { font_id: font, color, ..Default::default() });
-    job.wrap = TextWrapping { max_width: max_w, max_rows, break_anywhere: true, overflow_character: Some('…') };
-    ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
+    job.wrap = TextWrapping {
+        max_width: max_w.max(0.0),
+        max_rows: max_rows.max(1),
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ctx.fonts_mut(|fonts| fonts.layout_job(job))
 }
 
 pub fn text_left(ui: &Ui, painter: &Painter, rect: Rect, text: &str, font: FontId, color: Color32, offset_x: f32) {
@@ -107,4 +122,25 @@ pub fn radial_glow(painter: &Painter, center: Pos2, radius: f32, color: Color32)
         mesh.add_triangle(0, 1 + i, 2 + i);
     }
     painter.add(egui::Shape::mesh(mesh));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_wrap_respects_max_rows_and_adds_ellipsis() {
+        let ctx = egui::Context::default();
+        let text = "A very long description that should wrap cleanly across two lines and truncate the rest with an ellipsis character.";
+        let mut rows_len = 0usize;
+        let mut last_row = String::new();
+        let mut output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            let g = layout_wrap(ctx, text, theme::font(12.0), Color32::WHITE, 120.0, 2);
+            rows_len = g.rows.len();
+            last_row = g.rows.last().map(|row| row.text().to_owned()).unwrap_or_default();
+        });
+        output.textures_delta.clear();
+        assert_eq!(rows_len, 2, "long text should wrap onto 2 rows at width 120");
+        assert!(last_row.ends_with('…'), "truncated row should end with ellipsis, got {last_row:?}");
+    }
 }

@@ -10,8 +10,8 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CLASSES_ROOT, KEY_READ, RRF_RT_ANY, RRF_RT_REG_BINARY, RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW,
-    RegGetValueW, RegOpenKeyExW,
+    HKEY, HKEY_CLASSES_ROOT, KEY_READ, RRF_RT_ANY, RRF_RT_REG_BINARY, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey,
+    RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -178,7 +178,10 @@ fn probe_template(root: HKEY, subkey: &str, ext: &str) -> Option<NewTemplate> {
 
 fn resolve_template_file(name: &str) -> Option<PathBuf> {
     let expanded = crate::shell::location::expand_env(name);
-    let name = expanded.trim_matches('"');
+    let name = expanded.trim().trim_matches('"');
+    if name.is_empty() {
+        return None;
+    }
     let direct = PathBuf::from(name);
     if direct.is_absolute() && direct.exists() {
         return Some(direct);
@@ -218,7 +221,7 @@ fn read_reg_string(hkey: windows::Win32::System::Registry::HKEY, name: &str) -> 
             hkey,
             PCWSTR::null(),
             PCWSTR(name_w.as_ptr()),
-            RRF_RT_REG_SZ,
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
             None,
             Some(buf.as_mut_ptr().cast::<c_void>()),
             Some(&mut size),
@@ -343,5 +346,33 @@ mod tests {
         let (created, _) = create_from_template(&root, &template).unwrap();
         assert_eq!(std::fs::read(created).unwrap(), b"template contents");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_template_file_expands_env_vars() {
+        let dir = std::env::temp_dir().join(format!("lumen-shellnew-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sample.tpl");
+        std::fs::write(&file, b"tpl").unwrap();
+
+        let templated = format!("%TEMP%\\lumen-shellnew-{}\\sample.tpl", std::process::id());
+        let resolved = resolve_template_file(&templated);
+        assert!(resolved.is_some(), "expected %TEMP% template path to resolve");
+        assert!(resolved.unwrap().ends_with("sample.tpl"));
+        assert!(resolve_template_file("%TEMP%\\lumen-shellnew-missing-xyz.tpl").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_reg_string_accepts_reg_expand_sz() {
+        // `User Shell Folders\Desktop` is a standard Windows REG_EXPAND_SZ value.
+        let subkey = HSTRING::from(r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders");
+        let mut hkey = Default::default();
+        if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), None, KEY_READ, &mut hkey) }.0 == 0 {
+            let val = read_reg_string(hkey, "Desktop");
+            let _ = unsafe { RegCloseKey(hkey) };
+            assert!(val.is_some_and(|s| !s.is_empty()), "expected REG_EXPAND_SZ Desktop value to be readable");
+        }
     }
 }

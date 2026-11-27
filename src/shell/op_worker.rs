@@ -19,22 +19,62 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::{
     FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING,
     FOFX_RECYCLEONDELETE, FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Vtbl,
-    IShellItem, SHCreateItemFromParsingName, SHGetIDListFromObject,
+    IShellItem, SHCreateItemFromIDList, SHCreateItemFromParsingName, SHGetIDListFromObject,
 };
 use windows::core::{GUID, HRESULT, HSTRING, IUnknown, IUnknown_Vtbl, Interface, PCWSTR};
 
-use crate::shell::location::item_path;
+use crate::shell::location::{Pidl, is_in_recycle_bin_path, item_path};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpOrigin {
+    Normal,
+    Undo,
+    Redo,
+}
 
 #[derive(Clone, Debug)]
 pub enum OpRequest {
-    Copy { items: Vec<PathBuf>, dest_dir: PathBuf },
-    Move { items: Vec<PathBuf>, dest_dir: PathBuf, clear_clipboard: bool },
-    Delete { items: Vec<PathBuf>, permanent: bool },
-    DeleteDirect { items: Vec<PathBuf> },
-    Restore { items: Vec<RecycledItem> },
-    Rename { from: PathBuf, new_name: String, is_undo: bool },
-    NewFolder { parent: PathBuf, name: String },
-    CreateShortcut { items: Vec<PathBuf>, dest_dir: PathBuf },
+    Copy {
+        items: Vec<PathBuf>,
+        dest_dir: PathBuf,
+    },
+    Move {
+        items: Vec<PathBuf>,
+        dest_dir: PathBuf,
+        clear_clipboard: bool,
+        origin: OpOrigin,
+    },
+    Delete {
+        items: Vec<PathBuf>,
+        permanent: bool,
+    },
+    /// Permanently deletes virtual shell items (e.g. Recycle Bin entries) via
+    /// their serialized absolute PIDLs so Windows cleans up `$R`/`$I` pairs
+    /// atomically and prompts with the original filenames for permanent deletion.
+    DeletePidls {
+        pidl_bytes: Vec<Vec<u8>>,
+    },
+    DeleteDirect {
+        items: Vec<PathBuf>,
+    },
+    Rename {
+        from: PathBuf,
+        new_name: String,
+        origin: OpOrigin,
+        target_tab_uid: Option<u64>,
+    },
+    NewFolder {
+        parent: PathBuf,
+        base_name: String,
+        target_tab_uid: Option<u64>,
+    },
+    CreateShortcut {
+        items: Vec<PathBuf>,
+        dest_dir: PathBuf,
+    },
+    Restore {
+        items: Vec<RecycledItem>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -47,12 +87,12 @@ pub struct OpProgress {
 #[derive(Clone, Debug)]
 pub enum OpResult {
     Copied { pairs: Vec<(PathBuf, PathBuf)> },
-    Moved { pairs: Vec<(PathBuf, PathBuf)>, clear_clipboard: bool },
-    Deleted { items: Vec<RecycledItem>, permanent: bool, count: usize },
-    DeletedDirect { count: usize },
+    Moved { pairs: Vec<(PathBuf, PathBuf)>, clear_clipboard: bool, origin: OpOrigin },
+    Deleted { items: Vec<RecycledItem>, affected_paths: Vec<PathBuf>, permanent: bool, count: usize },
+    DeletedDirect { items: Vec<PathBuf>, count: usize },
+    Renamed { from: PathBuf, to: PathBuf, origin: OpOrigin, target_tab_uid: Option<u64> },
+    CreatedFolder { path: PathBuf, name: String, target_tab_uid: Option<u64> },
     Restored { items: Vec<RecycledItem>, result: Result<usize, String> },
-    Renamed { from: PathBuf, to: PathBuf, is_undo: bool },
-    CreatedFolder { path: PathBuf, name: String },
     CreatedShortcuts { paths: Vec<PathBuf> },
 }
 
@@ -150,7 +190,11 @@ fn worker_loop(
 fn req_label(req: &OpRequest) -> String {
     match req {
         OpRequest::Copy { items, .. } => format!("正在复制 {} 个项目…", items.len()),
-        OpRequest::Move { items, .. } => format!("正在移动 {} 个项目…", items.len()),
+        OpRequest::Move { items, origin, .. } => match origin {
+            OpOrigin::Undo => format!("正在撤销移动 {} 个项目…", items.len()),
+            OpOrigin::Redo => format!("正在重做移动 {} 个项目…", items.len()),
+            OpOrigin::Normal => format!("正在移动 {} 个项目…", items.len()),
+        },
         OpRequest::Delete { items, permanent } => {
             if *permanent {
                 format!("正在永久删除 {} 个项目…", items.len())
@@ -158,10 +202,11 @@ fn req_label(req: &OpRequest) -> String {
                 format!("正在删除 {} 个项目…", items.len())
             }
         }
+        OpRequest::DeletePidls { pidl_bytes } => format!("正在永久删除 {} 个项目…", pidl_bytes.len()),
         OpRequest::DeleteDirect { items } => format!("正在撤销 {} 个项目…", items.len()),
         OpRequest::Restore { items } => format!("正在还原 {} 个项目…", items.len()),
         OpRequest::Rename { new_name, .. } => format!("正在重命名为 {new_name}…"),
-        OpRequest::NewFolder { name, .. } => format!("正在新建 {name}…"),
+        OpRequest::NewFolder { base_name, .. } => format!("正在新建 {base_name}…"),
         OpRequest::CreateShortcut { items, .. } => format!("正在创建 {} 个快捷方式…", items.len()),
     }
 }
@@ -174,6 +219,7 @@ struct SinkData {
     deleted: Mutex<Vec<PathBuf>>,
     deleting: Mutex<std::collections::HashMap<usize, PathBuf>>,
     recycled: Mutex<Vec<RecycledItem>>,
+    deleted_count: AtomicUsize,
 }
 
 #[repr(C)]
@@ -310,6 +356,9 @@ unsafe extern "system" fn sink_post_delete(
 ) -> HRESULT {
     let obj = unsafe { &*(this as *const SinkObject) };
     let original = obj.data.deleting.lock().ok().and_then(|mut items| items.remove(&(item as usize)));
+    if hr.is_ok() && original.as_ref().is_none_or(|path| !path.exists()) {
+        obj.data.deleted_count.fetch_add(1, Ordering::Relaxed);
+    }
     if hr.is_ok()
         && let Some(src) = original.or_else(|| unsafe { IShellItem::from_raw_borrowed(&item) }.and_then(item_path))
         && !src.exists()
@@ -410,10 +459,19 @@ fn new_sink(progress: Arc<Mutex<OpProgress>>) -> (IFileOperationProgressSink, Ar
         deleted: Mutex::new(Vec::new()),
         deleting: Mutex::new(std::collections::HashMap::new()),
         recycled: Mutex::new(Vec::new()),
+        deleted_count: AtomicUsize::new(0),
     });
     let obj = Box::new(SinkObject { vtable: &SINK_VTABLE, refs: AtomicU32::new(1), data: data.clone() });
     let sink = unsafe { IFileOperationProgressSink::from_raw(Box::into_raw(obj).cast::<c_void>()) };
     (sink, data)
+}
+
+fn finish_allow_cancel(res: windows::core::Result<()>) -> anyhow::Result<()> {
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) if crate::shell::ops::is_user_cancelled_hr(e.code().0 as u32) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn create_op(flags: FILEOPERATION_FLAGS, sink: &IFileOperationProgressSink) -> anyhow::Result<(IFileOperation, u32)> {
@@ -454,11 +512,11 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             }
             let res = unsafe { op.PerformOperations() };
             let _ = unsafe { op.Unadvise(cookie) };
-            res?;
+            finish_allow_cancel(res)?;
             let pairs = data.landed_pairs.lock().unwrap().clone();
             Ok(OpResult::Copied { pairs })
         }
-        OpRequest::Move { items, dest_dir, clear_clipboard } => {
+        OpRequest::Move { items, dest_dir, clear_clipboard, origin } => {
             let (op, cookie) = create_op(FOF_ALLOWUNDO, &sink)?;
             let dest = shell_item(&dest_dir)?;
             for item in &items {
@@ -467,11 +525,13 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             }
             let res = unsafe { op.PerformOperations() };
             let _ = unsafe { op.Unadvise(cookie) };
-            res?;
+            finish_allow_cancel(res)?;
             let pairs = data.landed_pairs.lock().unwrap().clone();
-            Ok(OpResult::Moved { pairs, clear_clipboard })
+            Ok(OpResult::Moved { pairs, clear_clipboard, origin })
         }
         OpRequest::Delete { items, permanent } => {
+            // Never attempt to recycle items already inside a physical `$Recycle.Bin` folder.
+            let permanent = permanent || (!items.is_empty() && items.iter().all(|p| is_in_recycle_bin_path(p)));
             let flags = if permanent {
                 FOF_WANTNUKEWARNING
             } else {
@@ -484,10 +544,39 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             }
             let res = unsafe { op.PerformOperations() };
             let _ = unsafe { op.Unadvise(cookie) };
-            res?;
-            let count = data.deleted.lock().unwrap().len();
+            finish_allow_cancel(res)?;
+            let count = data.deleted_count.load(Ordering::Relaxed);
             let items = data.recycled.lock().unwrap().clone();
-            Ok(OpResult::Deleted { items, permanent, count })
+            let affected_paths = data.deleted.lock().unwrap().clone();
+            Ok(OpResult::Deleted { items, affected_paths, permanent, count })
+        }
+        OpRequest::DeletePidls { pidl_bytes } => {
+            // Permanent delete via Recycle Bin PIDLs: omitting FOF_ALLOWUNDO and
+            // FOFX_RECYCLEONDELETE makes Windows show the native permanent-delete
+            // confirmation with original filenames and remove `$R`/`$I` pairs cleanly.
+            let (op, cookie) = create_op(FOF_WANTNUKEWARNING, &sink)?;
+            let mut queued_any = false;
+            for bytes in &pidl_bytes {
+                let Some(pidl) = Pidl::from_bytes(bytes) else { continue };
+                let shell: IShellItem = unsafe { SHCreateItemFromIDList(pidl.as_ptr()) }
+                    .map_err(|e| anyhow::anyhow!("SHCreateItemFromIDList failed: {e}"))?;
+                unsafe { op.DeleteItem(&shell, None::<&IFileOperationProgressSink>) }?;
+                queued_any = true;
+            }
+            if !queued_any {
+                let _ = unsafe { op.Unadvise(cookie) };
+                return Ok(OpResult::Deleted {
+                    items: Vec::new(),
+                    affected_paths: Vec::new(),
+                    permanent: true,
+                    count: 0,
+                });
+            }
+            let res = unsafe { op.PerformOperations() };
+            let _ = unsafe { op.Unadvise(cookie) };
+            finish_allow_cancel(res)?;
+            let count = data.deleted_count.load(Ordering::Relaxed);
+            Ok(OpResult::Deleted { items: Vec::new(), affected_paths: Vec::new(), permanent: true, count })
         }
         OpRequest::DeleteDirect { items } => {
             let (op, cookie) = create_op(FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING, &sink)?;
@@ -501,10 +590,11 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             let res = unsafe { op.PerformOperations() };
             let _ = unsafe { op.Unadvise(cookie) };
             res?;
-            let count = data.deleted.lock().unwrap().len();
-            Ok(OpResult::DeletedDirect { count })
+            let deleted = data.deleted.lock().unwrap().clone();
+            let count = deleted.len();
+            Ok(OpResult::DeletedDirect { items: deleted, count })
         }
-        OpRequest::Rename { from, new_name, is_undo } => {
+        OpRequest::Rename { from, new_name, origin, target_tab_uid } => {
             crate::shell::ops::validate_name(&new_name)?;
             let (op, cookie) = create_op(FILEOPERATION_FLAGS(0), &sink)?;
             let shell = shell_item(&from)?;
@@ -520,9 +610,10 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
                 .first()
                 .map(|(_, to)| to.clone())
                 .unwrap_or_else(|| from.parent().map(|p| p.join(&new_name)).unwrap_or_else(|| from.clone()));
-            Ok(OpResult::Renamed { from, to, is_undo })
+            Ok(OpResult::Renamed { from, to, origin, target_tab_uid })
         }
-        OpRequest::NewFolder { parent, name } => {
+        OpRequest::NewFolder { parent, base_name, target_tab_uid } => {
+            let name = crate::app::unique_name(&parent, &base_name, "");
             crate::shell::ops::validate_name(&name)?;
             let (op, cookie) = create_op(FILEOPERATION_FLAGS(0), &sink)?;
             let dir = shell_item(&parent)?;
@@ -540,7 +631,8 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
                 .first()
                 .map(|(_, to)| to.clone())
                 .unwrap_or_else(|| parent.join(&name));
-            Ok(OpResult::CreatedFolder { path: created, name })
+            let actual_name = created.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(name);
+            Ok(OpResult::CreatedFolder { path: created, name: actual_name, target_tab_uid })
         }
         OpRequest::CreateShortcut { items, dest_dir } => {
             let mut paths = Vec::new();
@@ -587,5 +679,48 @@ mod tests {
         assert_eq!(std::fs::read(&second).unwrap(), b"second");
         std::fs::remove_dir_all(root).unwrap();
         unsafe { CoUninitialize() };
+    }
+
+    #[test]
+    fn treats_shell_cancel_hresults_as_benign() {
+        let cancel = windows::core::Error::from_hresult(HRESULT(0x8027_0000u32 as i32));
+        assert!(finish_allow_cancel(Err(cancel)).is_ok());
+        let win32_cancel = windows::core::Error::from_hresult(HRESULT(0x8007_04C7u32 as i32));
+        assert!(finish_allow_cancel(Err(win32_cancel)).is_ok());
+        let access_denied = windows::core::Error::from_hresult(HRESULT(0x8007_0005u32 as i32));
+        assert!(finish_allow_cancel(Err(access_denied)).is_err());
+    }
+
+    #[test]
+    fn rapid_new_folder_requests_deduplicate_sequentially_in_worker() {
+        let root = std::env::temp_dir().join(format!("lumen-op-newfolder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let worker = OpWorker::new();
+        for _ in 0..3 {
+            worker.submit(OpRequest::NewFolder {
+                parent: root.clone(),
+                base_name: "新建文件夹".to_string(),
+                target_tab_uid: Some(42),
+            });
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut created = Vec::new();
+        while created.len() < 3 && std::time::Instant::now() < deadline {
+            for item in worker.poll() {
+                let Ok(OpResult::CreatedFolder { name, target_tab_uid, .. }) = item.result else {
+                    panic!("unexpected op result: {:?}", item.result);
+                };
+                assert_eq!(target_tab_uid, Some(42));
+                created.push(name);
+            }
+            if created.len() < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert_eq!(created, vec!["新建文件夹", "新建文件夹 (2)", "新建文件夹 (3)"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

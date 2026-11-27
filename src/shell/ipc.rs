@@ -5,15 +5,18 @@
 //! the parsed `LaunchCommand` over `\\.\pipe\LumenExplorer.IPC.v1` to the
 //! primary instance (opening a new tab in < 15ms) unless `--new-window` is set.
 
-use std::ffi::c_void;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE,
+    INVALID_HANDLE_VALUE,
+};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile, WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
+    ReadFile, WriteFile,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -33,6 +36,8 @@ pub enum LaunchTarget {
     SelectFile(PathBuf),
     /// Open a shell parsing name (`::{GUID}`, `shell:...`, or raw path string).
     OpenShell(String),
+    /// Request the running primary instance to save state and exit cleanly (`--quit`).
+    Quit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,13 +45,14 @@ pub struct CliOptions {
     pub target: LaunchTarget,
     pub new_window: bool,
     pub start_background: bool,
+    pub quit: bool,
 }
 
 /// Parses Windows Explorer–compatible command-line flags:
 /// - `<dir_or_file>`
 /// - `/select,<path>` or `/select, <path>`
 /// - `/e,<path>`, `/root,<path>`, `/n`
-/// - `--new-window`, `--background`
+/// - `--new-window`, `--background`, `--quit`
 pub fn parse_args<I, S>(args: I) -> CliOptions
 where
     I: IntoIterator<Item = S>,
@@ -55,6 +61,7 @@ where
     let raw: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
     let mut new_window = false;
     let mut start_background = false;
+    let mut quit = false;
     let mut select_next = false;
     let mut target = LaunchTarget::Default;
 
@@ -64,6 +71,11 @@ where
             continue;
         }
         let lower = trimmed.to_ascii_lowercase();
+        if lower == "--quit" || lower == "--exit" {
+            quit = true;
+            target = LaunchTarget::Quit;
+            continue;
+        }
         if lower == "--new-window" || lower == "/n" {
             new_window = true;
             continue;
@@ -95,19 +107,22 @@ where
             if lower.starts_with("/n,") {
                 new_window = true;
             }
-            let p = rest.trim().trim_matches('"');
-            if !p.is_empty() {
-                target = classify_target(p);
+            let cleaned = crate::shell::location::normalize_drive_spec(rest);
+            if !cleaned.is_empty() {
+                target = classify_target(&cleaned);
             }
             continue;
         }
         if lower == "/e" || lower == "/root" {
             continue;
         }
-        target = classify_target(trimmed.trim_matches('"'));
+        let cleaned = crate::shell::location::normalize_drive_spec(trimmed);
+        if !cleaned.is_empty() {
+            target = classify_target(&cleaned);
+        }
     }
 
-    CliOptions { target, new_window, start_background }
+    CliOptions { target, new_window, start_background, quit }
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -119,7 +134,8 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 fn classify_target(raw: &str) -> LaunchTarget {
-    let expanded = crate::shell::location::expand_env(raw);
+    let normalized = crate::shell::location::normalize_drive_spec(raw);
+    let expanded = crate::shell::location::normalize_drive_spec(&crate::shell::location::expand_env(&normalized));
     if expanded.starts_with("::{") || expanded.to_ascii_lowercase().starts_with("shell:") {
         return LaunchTarget::OpenShell(expanded);
     }
@@ -136,29 +152,57 @@ fn classify_target(raw: &str) -> LaunchTarget {
 /// Attempts to forward `target` to an already-running primary Lumen window.
 /// Returns `true` when delivered so the caller can exit immediately.
 pub fn try_send_to_existing(target: &LaunchTarget) -> bool {
-    let pipe_wide = HSTRING::from(PIPE_NAME);
-    // Quick non-blocking wait in case another client just disconnected.
-    let _ = unsafe { WaitNamedPipeW(PCWSTR(pipe_wide.as_ptr()), 120) };
-    let Ok(handle) = (unsafe {
-        CreateFileW(
-            PCWSTR(pipe_wide.as_ptr()),
-            FILE_GENERIC_WRITE.0,
-            FILE_SHARE_NONE,
-            None,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-    }) else {
-        return false;
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return false;
-    }
+    let extended_retry = crate::platform::is_primary_instance_running();
+    try_send_to_pipe(PIPE_NAME, target, extended_retry)
+}
+
+fn try_send_to_pipe(pipe_name: &str, target: &LaunchTarget, extended_retry: bool) -> bool {
     let Ok(payload) = serde_json::to_vec(target) else {
-        let _ = unsafe { CloseHandle(handle) };
         return false;
     };
+    let pipe_wide = HSTRING::from(pipe_name);
+    let not_found_delays: &[u64] = if extended_retry { &[15, 30, 50, 80, 120] } else { &[10, 20] };
+    let busy_delays: &[u64] = &[10, 20, 40, 80, 120];
+    let mut not_found_retries = 0usize;
+    let mut busy_retries = 0usize;
+
+    let handle = loop {
+        // Brief wait in case another client is finishing up on the pipe.
+        let _ = unsafe { WaitNamedPipeW(PCWSTR(pipe_wide.as_ptr()), 80) };
+        match unsafe {
+            CreateFileW(
+                PCWSTR(pipe_wide.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        } {
+            Ok(h) if h != INVALID_HANDLE_VALUE => break h,
+            Ok(_) => return false,
+            Err(err) => {
+                let code = err.code();
+                if code == windows::core::HRESULT::from_win32(ERROR_PIPE_BUSY.0) {
+                    let Some(&delay_ms) = busy_delays.get(busy_retries) else {
+                        return false;
+                    };
+                    busy_retries += 1;
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                } else if code == windows::core::HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) {
+                    let Some(&delay_ms) = not_found_delays.get(not_found_retries) else {
+                        return false;
+                    };
+                    not_found_retries += 1;
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                } else {
+                    return false;
+                }
+            }
+        }
+    };
+
     let mut written = 0u32;
     let ok = unsafe { WriteFile(handle, Some(&payload), Some(&mut written), None) }.is_ok()
         && written as usize == payload.len();
@@ -173,45 +217,75 @@ pub fn start_server() -> Receiver<LaunchTarget> {
     rx
 }
 
+fn create_pipe_instance(pipe_wide: &HSTRING) -> HANDLE {
+    unsafe {
+        CreateNamedPipeW(
+            PCWSTR(pipe_wide.as_ptr()),
+            PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            8,
+            0,
+            4096,
+            0,
+            None,
+        )
+    }
+}
+
 fn server_loop(tx: Sender<LaunchTarget>) {
-    let pipe_wide = HSTRING::from(PIPE_NAME);
+    serve_pipe_loop(PIPE_NAME, tx, false, crate::platform::request_force_quit);
+}
+
+fn serve_pipe_loop(pipe_name: &str, tx: Sender<LaunchTarget>, stop_on_quit: bool, on_quit: impl Fn()) {
+    let pipe_wide = HSTRING::from(pipe_name);
+    let mut pipe = create_pipe_instance(&pipe_wide);
     loop {
-        let pipe = unsafe {
-            CreateNamedPipeW(
-                PCWSTR(pipe_wide.as_ptr()),
-                PIPE_ACCESS_INBOUND,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                8,
-                0,
-                4096,
-                0,
-                None,
-            )
-        };
         if pipe == INVALID_HANDLE_VALUE {
             // Another primary instance already owns the pipe or OS error.
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::thread::sleep(Duration::from_secs(2));
+            pipe = create_pipe_instance(&pipe_wide);
             continue;
         }
         let connected = match unsafe { ConnectNamedPipe(pipe, None) } {
             Ok(()) => true,
-            Err(err) => err.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0),
+            Err(err) => {
+                // A client may have written and closed before we reach ConnectNamedPipe.
+                // ERROR_NO_DATA still leaves its buffered request available to ReadFile.
+                err.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0)
+                    || err.code() == windows::core::HRESULT::from_win32(ERROR_NO_DATA.0)
+            }
         };
+        // Pre-create the next listening instance before reading/disconnecting/closing
+        // the current one so there is never a gap with zero listening pipe instances.
+        let next_pipe = create_pipe_instance(&pipe_wide);
+        let mut should_stop = false;
         if connected {
             let mut buf = vec![0u8; 4096];
             let mut read = 0u32;
             if unsafe { ReadFile(pipe, Some(&mut buf), Some(&mut read), None) }.is_ok() && read > 0 {
                 buf.truncate(read as usize);
                 if let Ok(target) = serde_json::from_slice::<LaunchTarget>(&buf) {
-                    let _ = tx.send(target);
-                    crate::platform::restore_and_focus();
-                    crate::platform::wake();
+                    if target == LaunchTarget::Quit {
+                        on_quit();
+                        if stop_on_quit {
+                            should_stop = true;
+                        }
+                    } else {
+                        let _ = tx.send(target);
+                        crate::platform::wake();
+                    }
                 }
             }
             let _ = unsafe { DisconnectNamedPipe(pipe) };
         }
         let _ = unsafe { CloseHandle(pipe) };
-        let _ = (FILE_GENERIC_READ, FILE_FLAGS_AND_ATTRIBUTES(0), std::ptr::null::<c_void>() as *const HANDLE);
+        if should_stop {
+            if next_pipe != INVALID_HANDLE_VALUE {
+                let _ = unsafe { CloseHandle(next_pipe) };
+            }
+            break;
+        }
+        pipe = next_pipe;
     }
 }
 
@@ -252,5 +326,71 @@ mod tests {
 
         let opts = parse_args(["/e,C:\\Windows"]);
         assert_eq!(opts.target, LaunchTarget::OpenDir(PathBuf::from("C:\\Windows")));
+        assert!(!opts.quit);
+
+        let opts = parse_args(["--quit"]);
+        assert!(opts.quit);
+        assert_eq!(opts.target, LaunchTarget::Quit);
+
+        let opts = parse_args(["--exit"]);
+        assert!(opts.quit);
+        assert_eq!(opts.target, LaunchTarget::Quit);
+    }
+
+    #[test]
+    fn normalizes_drive_specs_and_explorer_sentinel_paths() {
+        for input in ["C:", r#"C:""#, r#""C:""#, r"C:\.", r"C:\\."] {
+            assert_eq!(
+                classify_target(input),
+                LaunchTarget::OpenDir(PathBuf::from(r"C:\")),
+                "classify_target failed for {input:?}"
+            );
+            let opts = parse_args([input]);
+            assert_eq!(opts.target, LaunchTarget::OpenDir(PathBuf::from(r"C:\")), "parse_args failed for {input:?}");
+        }
+        assert_eq!(classify_target("c:"), LaunchTarget::OpenDir(PathBuf::from(r"c:\")));
+        assert_eq!(parse_args([r#"/e,C:""#]).target, LaunchTarget::OpenDir(PathBuf::from(r"C:\")));
+        assert_eq!(parse_args([r"C:\Windows\."]).target, LaunchTarget::OpenDir(PathBuf::from(r"C:\Windows")));
+    }
+
+    #[test]
+    fn pipe_server_handles_rapid_consecutive_sends_without_gap() {
+        let pipe = format!(r"\\.\pipe\LumenExplorer.IPC.Test.Rapid.{}", std::process::id());
+        let pipe_srv = pipe.clone();
+        let (tx, rx) = unbounded::<LaunchTarget>();
+        let handle = std::thread::spawn(move || {
+            serve_pipe_loop(&pipe_srv, tx, true, || {});
+        });
+
+        // Rapid consecutive invocations must all succeed without missing a pipe instance.
+        for i in 0..15 {
+            let target = LaunchTarget::OpenShell(format!("shell:Test{i}"));
+            assert!(try_send_to_pipe(&pipe, &target, true), "send {i} failed");
+        }
+        assert!(try_send_to_pipe(&pipe, &LaunchTarget::Quit, true));
+        handle.join().expect("server thread cleanly exits on Quit");
+
+        let received: Vec<LaunchTarget> = rx.try_iter().collect();
+        assert_eq!(received.len(), 15);
+        for (i, target) in received.into_iter().enumerate() {
+            assert_eq!(target, LaunchTarget::OpenShell(format!("shell:Test{i}")));
+        }
+    }
+
+    #[test]
+    fn client_retries_when_pipe_becomes_ready_shortly() {
+        let pipe = format!(r"\\.\pipe\LumenExplorer.IPC.Test.Retry.{}", std::process::id());
+        let pipe_srv = pipe.clone();
+        let (tx, rx) = unbounded::<LaunchTarget>();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            serve_pipe_loop(&pipe_srv, tx, true, || {});
+        });
+
+        let target = LaunchTarget::OpenDir(PathBuf::from(r"C:\"));
+        assert!(try_send_to_pipe(&pipe, &target, true));
+        assert!(try_send_to_pipe(&pipe, &LaunchTarget::Quit, true));
+        handle.join().expect("server thread exits cleanly");
+        assert_eq!(rx.try_recv().ok(), Some(target));
     }
 }

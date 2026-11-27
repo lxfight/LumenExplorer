@@ -56,7 +56,7 @@ impl Drive {
         if self.total == 0 {
             return 0.0;
         }
-        ((self.total - self.free) as f64 / self.total as f64) as f32
+        (self.total.saturating_sub(self.free) as f64 / self.total as f64).clamp(0.0, 1.0) as f32
     }
 
     pub fn path(&self) -> PathBuf {
@@ -155,5 +155,32 @@ fn probe_drive(root: &str) -> Drive {
         total,
         free,
         kind,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_drive(total: u64, free: u64) -> Drive {
+        Drive {
+            root: "C:\\".to_string(),
+            letter: Some('C'),
+            label: "OS".to_string(),
+            filesystem: "NTFS".to_string(),
+            total,
+            free,
+            kind: DriveKind::Fixed,
+        }
+    }
+
+    #[test]
+    fn used_fraction_handles_zero_and_free_exceeding_total() {
+        assert_eq!(sample_drive(0, 0).used_fraction(), 0.0);
+        assert_eq!(sample_drive(0, 100).used_fraction(), 0.0);
+        assert_eq!(sample_drive(100, 150).used_fraction(), 0.0);
+        assert_eq!(sample_drive(100, 100).used_fraction(), 0.0);
+        assert_eq!(sample_drive(100, 0).used_fraction(), 1.0);
+        assert!((sample_drive(100, 25).used_fraction() - 0.75).abs() < 1e-6);
     }
 }

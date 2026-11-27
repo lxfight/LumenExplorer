@@ -1,17 +1,22 @@
-//! Zero-registry Windows desktop coexistence helpers:
+//! Read-only Windows desktop integration probes & coexistence helpers:
 //! - Read-only `IShellWindows` COM query to import currently open Windows File
 //!   Explorer folders into Lumen tabs with one click (`Ctrl+Shift+O`).
-//! - Read-only lookup of the user's Windows Startup folder (`shell:startup`).
+//! - Read-only detection of installer-managed integrations (install mode,
+//!   "Open with Lumen" folder context menu, and auto-start entry).
 //!
-//! Lumen never modifies Windows Shell registry associations (`Folder\shell\open`
-//! or `DelegateExecute`) and never writes persistence files automatically.
+//! `lumen.exe` itself never writes Windows Shell registry keys or persistence
+//! files; optional shell integration is cleanly installed and removed by the
+//! Windows Installer (`LumenSetup`).
 
 use std::path::PathBuf;
 
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW, RegOpenKeyExW,
+};
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Shell::{IShellWindows, IWebBrowserApp, ShellWindows};
-use windows::core::Interface;
+use windows::core::{HSTRING, Interface, PCWSTR};
 
 /// Returns deduplicated local directory paths currently open in Windows File
 /// Explorer (`explorer.exe`) windows via read-only `IShellWindows` COM.
@@ -91,14 +96,49 @@ pub fn startup_folder() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// Read-only check whether the user has placed a Lumen shortcut in their Startup folder.
+/// Returns `true` when running from an Inno Setup installation (uninstaller present beside `lumen.exe`).
+pub fn is_installed() -> bool {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("unins000.exe").is_file())).unwrap_or(false)
+}
+
+/// Read-only check whether the installer-managed "Open with Lumen" folder context menu is registered.
+pub fn has_context_menu() -> bool {
+    const SUBKEY: &str = r"Software\Classes\Directory\shell\Lumen";
+    reg_key_exists(HKEY_CURRENT_USER, SUBKEY) || reg_key_exists(HKEY_LOCAL_MACHINE, SUBKEY)
+}
+
+/// Read-only check whether Lumen is configured to auto-start (via installer `Run` entry or `shell:startup`).
 pub fn is_auto_start() -> bool {
+    const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    if reg_sz_exists(HKEY_CURRENT_USER, RUN_KEY, "Lumen") || reg_sz_exists(HKEY_LOCAL_MACHINE, RUN_KEY, "Lumen") {
+        return true;
+    }
     startup_folder().is_some_and(|dir| {
         std::fs::read_dir(dir).ok().into_iter().flatten().flatten().any(|e| {
             let name = e.file_name().to_string_lossy().to_ascii_lowercase();
             name.contains("lumen") && name.ends_with(".lnk")
         })
     })
+}
+
+fn reg_key_exists(root: HKEY, subkey: &str) -> bool {
+    let wide = HSTRING::from(subkey);
+    let mut handle = HKEY::default();
+    let ok = unsafe { RegOpenKeyExW(root, PCWSTR(wide.as_ptr()), Some(0), KEY_READ, &mut handle) }.is_ok();
+    if ok {
+        let _ = unsafe { RegCloseKey(handle) };
+    }
+    ok
+}
+
+fn reg_sz_exists(root: HKEY, subkey: &str, value: &str) -> bool {
+    let sub = HSTRING::from(subkey);
+    let val = HSTRING::from(value);
+    let mut size: u32 = 0;
+    unsafe {
+        RegGetValueW(root, PCWSTR(sub.as_ptr()), PCWSTR(val.as_ptr()), RRF_RT_REG_SZ, None, None, Some(&mut size))
+            .is_ok()
+    }
 }
 
 #[cfg(test)]

@@ -3,27 +3,29 @@
 //! DPI geometry, theme detection, IME composition tracking, shell message hooks.
 
 use std::ffi::c_void;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicIsize, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_MAINWINDOW, DWMSBT_NONE, DWMWA_BORDER_COLOR,
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, ScreenToClient,
+    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromRect,
+    MonitorFromWindow, ScreenToClient,
 };
 use windows::Win32::System::DataExchange::AddClipboardFormatListener;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI,
+    SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
@@ -36,12 +38,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BringWindowToTop, CreatePopupMenu, DestroyMenu, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetWindowPlacement, GetWindowThreadProcessId, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT,
     HTMAXBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsIconic, IsWindowVisible, IsZoomed, LoadIconW, MF_SEPARATOR,
-    MF_STRING, PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+    MF_STRING, PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SendMessageW, SetForegroundWindow, ShowWindow,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOWPLACEMENT, WM_APP,
-    WM_CLIPBOARDUPDATE, WM_COMMAND, WM_DEVICECHANGE, WM_DRAWITEM, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_INITMENUPOPUP, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MEASUREITEM, WM_MENUSELECT,
-    WM_MOUSEMOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE,
-    WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_XBUTTONUP,
+    WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND, WM_DEVICECHANGE, WM_DRAWITEM, WM_ENDSESSION, WM_HOTKEY,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENUPOPUP, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_MEASUREITEM, WM_MENUSELECT, WM_MOUSEMOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WM_XBUTTONUP,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -52,7 +55,13 @@ const TRAY_CMD_OPEN: u32 = 1;
 const TRAY_CMD_NEW_WINDOW: u32 = 2;
 const TRAY_CMD_QUIT: u32 = 3;
 
+/// Named Win32 Mutex shared with the Inno Setup installer (`AppMutex`) so
+/// upgrades and uninstalls reliably detect running instances (including in tray).
+const INSTANCE_MUTEX_NAME: &str = "LumenExplorer.SingleInstance.v1";
+
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
+static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
+static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
 static IME_CONTEXT: AtomicIsize = AtomicIsize::new(0);
 static IME_COMPOSING: AtomicBool = AtomicBool::new(false);
 static IME_END_TICK: AtomicU64 = AtomicU64::new(0);
@@ -63,12 +72,15 @@ static MOUSE_NAV: AtomicI8 = AtomicI8::new(0);
 /// Left edge (logical px) of empty draggable titlebar space (updated each frame by chrome).
 static TITLEBAR_DRAG_LEFT: AtomicI32 = AtomicI32::new(320);
 static MAX_BTN_HOVERED: AtomicBool = AtomicBool::new(false);
+static MODAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TRAY_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// 0 = none, 1 = open, 2 = new window, 3 = force quit.
 static TRAY_ACTION: AtomicU8 = AtomicU8::new(0);
 static HOTKEY_TRIGGERED: AtomicBool = AtomicBool::new(false);
 static HOTKEY_INSTALLED: AtomicBool = AtomicBool::new(false);
 static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
+type ShutdownHook = Arc<dyn Fn() + Send + Sync + 'static>;
+static SHUTDOWN_HOOK: Mutex<Option<ShutdownHook>> = Mutex::new(None);
 
 /// RGBA accent used by the shell when the registry has no accent color.
 const DEFAULT_ACCENT_ABGR: u32 = 0x00d47800; // #0078D4
@@ -88,7 +100,55 @@ pub fn init_process() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let app_id = HSTRING::from("Lumen.Explorer");
         let _ = SetCurrentProcessExplicitAppUserModelID(PCWSTR(app_id.as_ptr()));
+        let mutex_name = HSTRING::from(INSTANCE_MUTEX_NAME);
+        if let Ok(handle) = CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr()))
+            && !handle.is_invalid()
+        {
+            INSTANCE_MUTEX.store(handle.0 as isize, Ordering::Relaxed);
+        }
         OleInitialize(None).expect("OLE init failed");
+    }
+}
+
+/// Requests an unconditional clean shutdown (bypasses tray-resident hide-on-close),
+/// safe to invoke even while the window is hidden in the notification area.
+pub fn request_force_quit() {
+    FORCE_QUIT.store(true, Ordering::Relaxed);
+    let hwnd = hwnd();
+    if !hwnd.0.is_null() {
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    }
+    wake();
+}
+
+pub fn force_quit_requested() -> bool {
+    FORCE_QUIT.load(Ordering::Relaxed)
+}
+
+/// Returns true when a running primary Lumen instance holds the single-instance mutex.
+pub fn is_primary_instance_running() -> bool {
+    let mutex_name = HSTRING::from(INSTANCE_MUTEX_NAME);
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(mutex_name.as_ptr())) } {
+        Ok(handle) if !handle.is_invalid() => {
+            let _ = unsafe { CloseHandle(handle) };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Registers a synchronous hook invoked on `WM_ENDSESSION` so the app can flush
+/// settings and clean up resources before Windows terminates the process.
+pub fn register_shutdown_hook(hook: impl Fn() + Send + Sync + 'static) {
+    if let Ok(mut slot) = SHUTDOWN_HOOK.lock() {
+        *slot = Some(Arc::new(hook));
+    }
+}
+
+fn run_shutdown_hook() {
+    let hook = SHUTDOWN_HOOK.lock().ok().and_then(|slot| slot.clone());
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
@@ -127,6 +187,20 @@ pub fn set_titlebar_drag_left(logical_x: f32) {
 /// (Windows 11 Snap Layouts trigger).
 pub fn is_max_button_hovered() -> bool {
     MAX_BTN_HOVERED.load(Ordering::Relaxed)
+}
+
+/// Suppresses native `HTCAPTION` / `HTMAXBUTTON` hit-testing while a modal or
+/// popup overlay is open so clicks/hovers cannot drag or trigger Snap Layouts
+/// through the overlay.
+pub fn set_modal_active(active: bool) {
+    MODAL_ACTIVE.store(active, Ordering::Relaxed);
+    if active {
+        MAX_BTN_HOVERED.store(false, Ordering::Relaxed);
+    }
+}
+
+pub fn is_modal_active() -> bool {
+    MODAL_ACTIVE.load(Ordering::Relaxed)
 }
 
 /// Cached undocumented uxtheme dark-mode exports so repeated theme switches do
@@ -252,16 +326,16 @@ pub fn restore_and_focus() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
         let fg = GetForegroundWindow();
-        let fg_tid = GetWindowThreadProcessId(fg, None);
-        let cur_tid = GetCurrentThreadId();
-        let attached = fg_tid != 0 && fg_tid != cur_tid;
+        let fg_tid = if fg.0.is_null() { 0 } else { GetWindowThreadProcessId(fg, None) };
+        let target_tid = GetWindowThreadProcessId(hwnd, None);
+        let attached = fg_tid != 0 && target_tid != 0 && fg_tid != target_tid;
         if attached {
-            let _ = AttachThreadInput(fg_tid, cur_tid, true);
+            let _ = AttachThreadInput(fg_tid, target_tid, true);
         }
         let _ = BringWindowToTop(hwnd);
         let _ = SetForegroundWindow(hwnd);
         if attached {
-            let _ = AttachThreadInput(fg_tid, cur_tid, false);
+            let _ = AttachThreadInput(fg_tid, target_tid, false);
         }
     }
 }
@@ -297,7 +371,7 @@ pub fn set_tray_enabled(enabled: bool) {
         {
             data.hIcon = icon;
         }
-        let tip = "Lumen 文件资源管理器";
+        let tip = "Lumen 文件工作台";
         for (dst, src) in data.szTip.iter_mut().zip(tip.encode_utf16()) {
             *dst = src;
         }
@@ -338,6 +412,10 @@ pub fn set_global_hotkey(enabled: bool) -> bool {
 pub fn cleanup_on_exit() {
     let _ = set_global_hotkey(false);
     set_tray_enabled(false);
+    let raw = INSTANCE_MUTEX.swap(0, Ordering::Relaxed);
+    if raw != 0 {
+        let _ = unsafe { CloseHandle(HANDLE(raw as *mut c_void)) };
+    }
 }
 
 fn show_tray_menu(hwnd: HWND) {
@@ -368,6 +446,9 @@ fn show_tray_menu(hwnd: HWND) {
             TRAY_ACTION.store(cmd as u8, Ordering::Relaxed);
             if cmd == TRAY_CMD_OPEN {
                 restore_and_focus();
+            } else if cmd == TRAY_CMD_QUIT {
+                request_force_quit();
+                return;
             }
             wake();
         }
@@ -433,9 +514,81 @@ pub fn set_ime_enabled(enabled: bool) {
     }
 }
 
+fn monitor_dpi(monitor: HMONITOR) -> f32 {
+    let mut dpi_x = 0u32;
+    let mut dpi_y = 0u32;
+    if !monitor.is_invalid()
+        && unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_ok()
+        && dpi_x >= 96
+    {
+        return dpi_x as f32;
+    }
+    unsafe { GetDpiForSystem() }.max(96) as f32
+}
+
+/// Converts a `WINDOWPLACEMENT::rcNormalPosition` (workspace coordinates)
+/// into physical screen coordinates using the owning monitor's work-area offset.
+fn workarea_rect_to_screen(normal: RECT, monitor: RECT, work: RECT) -> RECT {
+    let dx = work.left - monitor.left;
+    let dy = work.top - monitor.top;
+    RECT { left: normal.left + dx, top: normal.top + dy, right: normal.right + dx, bottom: normal.bottom + dy }
+}
+
+/// Converts a physical screen rect into saved logical coordinates:
+/// `(x, y)` in primary/system logical coordinates (matching `eframe`/`winit`'s
+/// `with_position` startup scaling) and `(w, h)` in target monitor logical points.
+fn screen_rect_to_logical(screen: RECT, sys_scale: f32, target_scale: f32) -> (f32, f32, f32, f32) {
+    let sys_scale = sys_scale.max(1.0);
+    let target_scale = target_scale.max(1.0);
+    let x = screen.left as f32 / sys_scale;
+    let y = screen.top as f32 / sys_scale;
+    let w = ((screen.right - screen.left) as f32 / target_scale).max(820.0);
+    let h = ((screen.bottom - screen.top) as f32 / target_scale).max(520.0);
+    (x, y, w, h)
+}
+
+/// Clamps saved logical window geometry to a target monitor's physical work area
+/// using the target monitor's effective DPI for size scaling and system DPI for
+/// virtual-desktop position mapping.
+fn clamp_window_to_workarea(
+    x: Option<f32>,
+    y: Option<f32>,
+    w: f32,
+    h: f32,
+    work: RECT,
+    sys_scale: f32,
+    target_scale: f32,
+) -> (Option<f32>, Option<f32>, f32, f32) {
+    let sys_scale = sys_scale.max(1.0);
+    let target_scale = target_scale.max(1.0);
+    let w = if w.is_finite() { w } else { 1440.0 };
+    let h = if h.is_finite() { h } else { 900.0 };
+    let work_w_logical = ((work.right - work.left) as f32 / target_scale).max(820.0);
+    let work_h_logical = ((work.bottom - work.top) as f32 / target_scale).max(520.0);
+    let clamped_w = w.clamp(820.0, work_w_logical);
+    let clamped_h = h.clamp(520.0, work_h_logical);
+
+    let (cx, cy) = match (x.filter(|v| v.is_finite()), y.filter(|v| v.is_finite())) {
+        (Some(px), Some(py)) => {
+            let phys_w = clamped_w * target_scale;
+            let phys_h = clamped_h * target_scale;
+            let work_left = work.left as f32;
+            let work_top = work.top as f32;
+            let max_phys_x = (work.right as f32 - phys_w).max(work_left);
+            let max_phys_y = (work.bottom as f32 - phys_h).max(work_top);
+            let clamped_phys_x = (px * sys_scale).clamp(work_left, max_phys_x);
+            let clamped_phys_y = (py * sys_scale).clamp(work_top, max_phys_y);
+            (Some(clamped_phys_x / sys_scale), Some(clamped_phys_y / sys_scale))
+        }
+        _ => (None, None),
+    };
+    (cx, cy, clamped_w, clamped_h)
+}
+
 /// Returns the normal (non-maximized) window geometry in **logical points**
-/// using `GetWindowPlacement` and the window's DPI scale, so saving and
-/// restoring never drifts across high-DPI displays.
+/// using `GetWindowPlacement` converted from workspace to screen coordinates
+/// and scaled with the owning monitor's DPI, so saving and restoring never
+/// drifts across top/left taskbars or mixed-DPI multi-monitor setups.
 pub fn window_logical_rect() -> Option<(f32, f32, f32, f32)> {
     let hwnd = hwnd();
     if hwnd.0.is_null() {
@@ -443,42 +596,46 @@ pub fn window_logical_rect() -> Option<(f32, f32, f32, f32)> {
     }
     let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
     unsafe { GetWindowPlacement(hwnd, &mut placement) }.ok()?;
-    let rect = placement.rcNormalPosition;
-    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32;
-    let scale = dpi / 96.0;
-    let w = ((rect.right - rect.left) as f32 / scale).max(820.0);
-    let h = ((rect.bottom - rect.top) as f32 / scale).max(520.0);
-    Some((rect.left as f32 / scale, rect.top as f32 / scale, w, h))
+    let normal = placement.rcNormalPosition;
+    let monitor = unsafe {
+        let by_rect = MonitorFromRect(&normal, MONITOR_DEFAULTTONEAREST);
+        if by_rect.is_invalid() { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) } else { by_rect }
+    };
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let screen = if !monitor.is_invalid() && unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        workarea_rect_to_screen(normal, info.rcMonitor, info.rcWork)
+    } else {
+        normal
+    };
+    let sys_scale = unsafe { GetDpiForSystem() }.max(96) as f32 / 96.0;
+    let target_scale = if !monitor.is_invalid() {
+        monitor_dpi(monitor) / 96.0
+    } else {
+        unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0
+    };
+    Some(screen_rect_to_logical(screen, sys_scale, target_scale))
 }
 
 /// Clamps a saved logical window rect to the nearest connected monitor's
-/// logical work area so the window never spawns off-screen or oversized.
+/// work area using the target monitor's effective DPI so the window never
+/// spawns off-screen, drifts under top/left taskbars, or snaps back to primary.
 pub fn clamp_logical_window(x: Option<f32>, y: Option<f32>, w: f32, h: f32) -> (Option<f32>, Option<f32>, f32, f32) {
-    let dpi = unsafe { GetDpiForSystem() }.max(96) as f32;
-    let scale = dpi / 96.0;
-    let probe = POINT { x: (x.unwrap_or(100.0) * scale) as i32, y: (y.unwrap_or(100.0) * scale) as i32 };
+    let sys_scale = unsafe { GetDpiForSystem() }.max(96) as f32 / 96.0;
+    let px = x.filter(|v| v.is_finite()).unwrap_or(100.0);
+    let py = y.filter(|v| v.is_finite()).unwrap_or(100.0);
+    let probe = POINT {
+        x: (px * sys_scale).round().clamp(-1_000_000.0, 1_000_000.0) as i32,
+        y: (py * sys_scale).round().clamp(-1_000_000.0, 1_000_000.0) as i32,
+    };
     let monitor = unsafe { MonitorFromPoint(probe, MONITOR_DEFAULTTONEAREST) };
+    let target_scale = monitor_dpi(monitor) / 96.0;
     let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-    let work: RECT = if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+    let work: RECT = if !monitor.is_invalid() && unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
         info.rcWork
     } else {
-        RECT { left: 0, top: 0, right: (1920.0 * scale) as i32, bottom: (1080.0 * scale) as i32 }
+        RECT { left: 0, top: 0, right: (1920.0 * target_scale) as i32, bottom: (1080.0 * target_scale) as i32 }
     };
-    let work_left = work.left as f32 / scale;
-    let work_top = work.top as f32 / scale;
-    let work_w = ((work.right - work.left) as f32 / scale).max(820.0);
-    let work_h = ((work.bottom - work.top) as f32 / scale).max(520.0);
-    let clamped_w = w.clamp(820.0, work_w);
-    let clamped_h = h.clamp(520.0, work_h);
-    let (cx, cy) = match (x, y) {
-        (Some(px), Some(py)) => {
-            let max_x = (work_left + work_w - clamped_w).max(work_left);
-            let max_y = (work_top + work_h - clamped_h).max(work_top);
-            (Some(px.clamp(work_left, max_x)), Some(py.clamp(work_top, max_y)))
-        }
-        _ => (None, None),
-    };
-    (cx, cy, clamped_w, clamped_h)
+    clamp_window_to_workarea(x, y, w, h, work, sys_scale, target_scale)
 }
 
 pub fn is_maximized() -> bool {
@@ -532,7 +689,7 @@ fn hit_test_chrome(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
         }
     }
 
-    if (0.0..crate::theme::TITLEBAR_H).contains(&ly) {
+    if !is_modal_active() && (0.0..crate::theme::TITLEBAR_H).contains(&ly) {
         // Native HTMAXBUTTON enables Windows 11 Snap Layouts flyout on hover!
         if lx >= lw - 92.0 && lx < lw - 46.0 {
             return Some(LRESULT(HTMAXBUTTON as isize));
@@ -641,6 +798,17 @@ unsafe extern "system" fn subclass_proc(
                 return LRESULT(1);
             }
         }
+        WM_QUERYENDSESSION => return LRESULT(1),
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                FORCE_QUIT.store(true, Ordering::Relaxed);
+                run_shutdown_hook();
+                cleanup_on_exit();
+                let _ = unsafe { SendMessageW(hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))) };
+                wake();
+            }
+            return LRESULT(0);
+        }
         WM_COMMAND | WM_INITMENUPOPUP | WM_MEASUREITEM | WM_DRAWITEM | WM_MENUSELECT => {
             if let Some(result) = crate::shell::menu::handle_menu_message(msg, wparam, lparam) {
                 return result;
@@ -649,4 +817,104 @@ unsafe extern "system" fn subclass_proc(
         _ => {}
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn workarea_rect_to_screen_offsets_top_and_left_taskbars() {
+        let mon = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        // Top taskbar (48px tall)
+        let top_work = RECT { left: 0, top: 48, right: 1920, bottom: 1080 };
+        let normal = RECT { left: 100, top: 0, right: 1540, bottom: 900 };
+        let screen = workarea_rect_to_screen(normal, mon, top_work);
+        assert_eq!((screen.left, screen.top, screen.right, screen.bottom), (100, 48, 1540, 948));
+
+        // Left taskbar (64px wide)
+        let left_work = RECT { left: 64, top: 0, right: 1920, bottom: 1080 };
+        let normal_left = RECT { left: 0, top: 80, right: 1440, bottom: 980 };
+        let screen_left = workarea_rect_to_screen(normal_left, mon, left_work);
+        assert_eq!((screen_left.left, screen_left.top, screen_left.right, screen_left.bottom), (64, 80, 1504, 980));
+
+        // Bottom taskbar (no origin offset)
+        let bottom_work = RECT { left: 0, top: 0, right: 1920, bottom: 1032 };
+        let screen_bottom = workarea_rect_to_screen(normal, mon, bottom_work);
+        assert_eq!(
+            (screen_bottom.left, screen_bottom.top, screen_bottom.right, screen_bottom.bottom),
+            (100, 0, 1540, 900)
+        );
+    }
+
+    #[test]
+    fn roundtrip_window_geometry_with_top_and_left_taskbar_has_zero_drift() {
+        // 150% HiDPI display with 60px top taskbar
+        let mon = RECT { left: 0, top: 0, right: 2560, bottom: 1440 };
+        let work = RECT { left: 0, top: 60, right: 2560, bottom: 1440 };
+        let scale = 1.5f32;
+        let normal = RECT { left: 150, top: 0, right: 150 + 2160, bottom: 1350 };
+        let screen = workarea_rect_to_screen(normal, mon, work);
+        let (x, y, w, h) = screen_rect_to_logical(screen, scale, scale);
+        assert_eq!((x, y, w, h), (100.0, 40.0, 1440.0, 900.0));
+
+        let (cx, cy, cw, ch) = clamp_window_to_workarea(Some(x), Some(y), w, h, work, scale, scale);
+        assert_eq!((cx, cy, cw, ch), (Some(100.0), Some(40.0), 1440.0, 900.0));
+    }
+
+    #[test]
+    fn mixed_dpi_multi_monitor_clamping_preserves_secondary_monitor() {
+        // Case A: Primary 100% (sys_scale = 1.0), Secondary 200% (target_scale = 2.0) on the right
+        let sec_mon = RECT { left: 1920, top: 0, right: 5760, bottom: 2160 };
+        let sec_work = RECT { left: 1920, top: 0, right: 5760, bottom: 2080 };
+        let normal = RECT { left: 2020, top: 100, right: 2020 + 2880, bottom: 100 + 1800 };
+        let screen = workarea_rect_to_screen(normal, sec_mon, sec_work);
+        let (x, y, w, h) = screen_rect_to_logical(screen, 1.0, 2.0);
+        assert_eq!((x, y, w, h), (2020.0, 100.0, 1440.0, 900.0));
+
+        let (cx, cy, cw, ch) = clamp_window_to_workarea(Some(x), Some(y), w, h, sec_work, 1.0, 2.0);
+        assert_eq!((cx, cy, cw, ch), (Some(2020.0), Some(100.0), 1440.0, 900.0));
+
+        // Oversized window on 200% secondary monitor clamps to target monitor's logical workarea (1920x1040), not 3840x2080!
+        let (ox, oy, ow, oh) = clamp_window_to_workarea(Some(2500.0), Some(500.0), 3000.0, 2000.0, sec_work, 1.0, 2.0);
+        assert_eq!((ox, oy, ow, oh), (Some(1920.0), Some(0.0), 1920.0, 1040.0));
+
+        // Case B: Primary 200% (sys_scale = 2.0), Secondary 100% (target_scale = 1.0) on the left (negative coords)
+        let left_mon = RECT { left: -1920, top: 0, right: 0, bottom: 1080 };
+        let left_work = RECT { left: -1920, top: 0, right: 0, bottom: 1040 };
+        let normal_neg = RECT { left: -1820, top: 100, right: -380, bottom: 1000 };
+        let screen_neg = workarea_rect_to_screen(normal_neg, left_mon, left_work);
+        let (nx, ny, nw, nh) = screen_rect_to_logical(screen_neg, 2.0, 1.0);
+        assert_eq!((nx, ny, nw, nh), (-910.0, 50.0, 1440.0, 900.0));
+
+        let (cnx, cny, cnw, cnh) = clamp_window_to_workarea(Some(nx), Some(ny), nw, nh, left_work, 2.0, 1.0);
+        assert_eq!((cnx, cny, cnw, cnh), (Some(-910.0), Some(50.0), 1440.0, 900.0));
+    }
+
+    #[test]
+    fn modal_active_flag_toggles_and_clears_max_hover() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        MAX_BTN_HOVERED.store(true, Ordering::Relaxed);
+        set_modal_active(true);
+        assert!(is_modal_active());
+        assert!(!is_max_button_hovered());
+        set_modal_active(false);
+        assert!(!is_modal_active());
+    }
+
+    #[test]
+    fn shutdown_hook_invokes_registered_callback() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+        register_shutdown_hook(move || {
+            hits_clone.fetch_add(1, Ordering::Relaxed);
+        });
+        run_shutdown_hook();
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        *SHUTDOWN_HOOK.lock().unwrap() = None;
+    }
 }

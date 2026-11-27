@@ -14,6 +14,7 @@ pub mod ops;
 pub mod search;
 pub mod shellnew;
 pub mod suggest;
+pub mod updater;
 pub mod watch;
 
 pub use location::Pidl;

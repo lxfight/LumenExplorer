@@ -223,14 +223,24 @@ fn stress_soak() {
         let copied = pairs[0].1.clone();
         let OpResult::Renamed { to: renamed, .. } = operation(
             &app.op_worker,
-            OpRequest::Rename { from: copied, new_name: format!("renamed-{cycle}.txt"), is_undo: false },
+            OpRequest::Rename {
+                from: copied,
+                new_name: format!("renamed-{cycle}.txt"),
+                origin: crate::shell::op_worker::OpOrigin::Normal,
+                target_tab_uid: None,
+            },
             &mut report,
         ) else {
             panic!("rename result")
         };
         let OpResult::Moved { pairs, .. } = operation(
             &app.op_worker,
-            OpRequest::Move { items: vec![renamed], dest_dir: op_src.clone(), clear_clipboard: false },
+            OpRequest::Move {
+                items: vec![renamed],
+                dest_dir: op_src.clone(),
+                clear_clipboard: false,
+                origin: crate::shell::op_worker::OpOrigin::Normal,
+            },
             &mut report,
         ) else {
             panic!("move result")

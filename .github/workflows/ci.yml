@@ -33,8 +33,21 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
+      - name: Ensure Inno Setup 6
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe") -and -not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build Windows Installer
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File installer\build.ps1 -SkipCargoBuild
+
       - uses: actions/upload-artifact@v4
         with:
-          name: lumen-windows-x64
-          path: target/release/lumen.exe
+          name: lumen-installer-windows-x64
+          path: |
+            dist/LumenSetup-*-x64.exe
+            dist/LumenSetup-*-x64.exe.sha256
           if-no-files-found: error

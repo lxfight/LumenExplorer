@@ -1,6 +1,8 @@
 # Build artifacts
 /target
 target/
+/dist
+dist/
 
 # Local development docs, scripts, and captures
 /IMPLEMENTATION_PLAN.md

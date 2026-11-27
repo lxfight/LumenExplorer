@@ -7,8 +7,9 @@ mod input;
 #[cfg(test)]
 mod stress;
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use egui::{Pos2, Rect, Vec2};
@@ -48,6 +49,8 @@ pub struct LumenApp {
     pub(crate) op_worker: OpWorker,
     drives_rx: Option<crossbeam_channel::Receiver<Vec<Drive>>>,
     ipc_rx: Option<crossbeam_channel::Receiver<crate::shell::ipc::LaunchTarget>>,
+    pub(crate) update_state: crate::shell::updater::UpdateState,
+    update_rx: Option<crossbeam_channel::Receiver<crate::shell::updater::UpdateEvent>>,
     pub(crate) force_quit: bool,
     suggest_rx: Option<crossbeam_channel::Receiver<crate::shell::suggest::Suggestions>>,
     suggest_gen: u64,
@@ -60,7 +63,12 @@ pub struct LumenApp {
     pub(crate) crumb_menu: Option<CrumbDropdown>,
     pub(crate) last_selected_click: Option<(usize, f64)>,
     pub(crate) address: AddressState,
+    pub(crate) address_suggest_rect: Option<egui::Rect>,
+    pub(crate) address_cursor_end: bool,
     pub(crate) search: SearchUi,
+    pub(crate) tab_search: HashMap<u64, TabSearchSnapshot>,
+    pub(crate) search_owner_uid: Option<u64>,
+    last_focused_tab_uid: u64,
     pub(crate) sidebar: SidebarState,
     pub(crate) toasts: Vec<Toast>,
     pub(crate) dialog: Option<Dialog>,
@@ -73,7 +81,9 @@ pub struct LumenApp {
     pub(crate) last_save: f64,
     pub(crate) menu_anchor: Option<egui::Pos2>,
     pub(crate) ctx_menu: Option<crate::ui::context_menu::ContextMenuState>,
-    archive_rx: Option<crossbeam_channel::Receiver<crate::shell::archive::ArchiveOutcome>>,
+    archive_rxs: Vec<(PathBuf, crossbeam_channel::Receiver<crate::shell::archive::ArchiveOutcome>)>,
+    pub(crate) pending_spring_clear_tabs: Vec<u64>,
+    shutdown_settings: Arc<Mutex<Option<Settings>>>,
     pub(crate) theme_cycle_requested: bool,
     pub(crate) dialog_was_open: bool,
     pub(crate) drop_zones: Vec<(egui::Rect, PathBuf)>,
@@ -141,6 +151,14 @@ pub(crate) struct SearchUi {
     pub typed_text: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TabSearchSnapshot {
+    pub query: String,
+    pub root: Option<PathBuf>,
+    pub last_query: String,
+    pub typed_text: String,
+}
+
 pub(crate) struct SidebarState {
     pub quick: Vec<QuickItem>,
     pub drives: Vec<Drive>,
@@ -171,6 +189,7 @@ pub(crate) enum UndoEntry {
 
 pub(crate) struct RenameState {
     pub row: usize,
+    pub target_path: PathBuf,
     pub buf: String,
     pub focus: bool,
     /// False selects only the filename stem (Explorer default); pressing F2 a
@@ -251,12 +270,21 @@ pub(crate) enum Command {
     Redo,
     SortBy(SortKey),
     CycleTheme,
+    CheckUpdates,
+    DownloadUpdate,
+    InstallUpdate,
+    SkipUpdateVersion,
+    OpenReleasesPage,
 }
 
 impl LumenApp {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: Settings, cli: crate::shell::ipc::CliOptions) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         platform::set_repaint_ctx(&cc.egui_ctx);
+        let mut settings = settings;
+        if cli.start_background {
+            settings.tray_resident = true;
+        }
         let mut app = Self::with_context(&cc.egui_ctx, settings);
         if !cli.new_window {
             app.ipc_rx = Some(crate::shell::ipc::start_server());
@@ -270,6 +298,20 @@ impl LumenApp {
         if cli.target != crate::shell::ipc::LaunchTarget::Default {
             app.handle_launch_target(cli.target, false);
         }
+        if crate::shell::updater::should_auto_check(app.settings.auto_check_updates, app.settings.last_update_check) {
+            app.start_update_check(false, Duration::from_secs(3));
+        }
+        let initial_snapshot = app.settings_snapshot();
+        app.update_shutdown_settings(&initial_snapshot);
+        let shared_settings = Arc::clone(&app.shutdown_settings);
+        platform::register_shutdown_hook(move || {
+            if let Ok(guard) = shared_settings.lock()
+                && let Some(snapshot) = guard.as_ref()
+            {
+                let _ = settings::save(snapshot);
+            }
+            save_window_state_now();
+        });
         app
     }
 
@@ -321,11 +363,22 @@ impl LumenApp {
             }
         }
         let active = settings.active_tab.min(tabs.len() - 1);
+        let initial_uid = tabs[active].uid;
 
         let (clipboard_files, cut_paths) = read_clipboard_state();
-        let secondary_tab = settings
-            .split_view
-            .then(|| Tab::new(tabs[active].location.clone(), settings.show_hidden, settings.show_system));
+        let secondary_tab = settings.split_view.then(|| {
+            let mut sec = Tab::new(tabs[active].location.clone(), settings.show_hidden, settings.show_system);
+            if let Some(view) = default_view {
+                sec.view = view;
+            }
+            if let Some(key) = default_sort {
+                sec.sort.key = key;
+                sec.sort.ascending = settings.sort_ascending;
+                sec.resort();
+            }
+            apply_folder_view_to_tab(&settings, &mut sec);
+            sec
+        });
         let split_ratio = settings.split_ratio.unwrap_or(0.5).clamp(0.25, 0.75);
         let details_w = settings.details_width.unwrap_or(300.0).clamp(240.0, 560.0);
         let mut app = Self {
@@ -346,6 +399,8 @@ impl LumenApp {
             op_worker: OpWorker::new(),
             drives_rx: None,
             ipc_rx: None,
+            update_state: crate::shell::updater::UpdateState::Idle,
+            update_rx: None,
             force_quit: false,
             suggest_rx: None,
             suggest_gen: 0,
@@ -367,6 +422,8 @@ impl LumenApp {
                 suggestions_source: String::new(),
                 pill: None,
             },
+            address_suggest_rect: None,
+            address_cursor_end: false,
             search: SearchUi {
                 query: String::new(),
                 engine: SearchEngine::new(),
@@ -376,6 +433,9 @@ impl LumenApp {
                 typed_at: 0.0,
                 typed_text: String::new(),
             },
+            tab_search: HashMap::new(),
+            search_owner_uid: None,
+            last_focused_tab_uid: initial_uid,
             sidebar: SidebarState { quick: Vec::new(), drives: Vec::new(), quick_open: true, pc_open: true },
             toasts: Vec::new(),
             dialog: None,
@@ -388,7 +448,9 @@ impl LumenApp {
             last_save: 0.0,
             menu_anchor: None,
             ctx_menu: None,
-            archive_rx: None,
+            archive_rxs: Vec::new(),
+            pending_spring_clear_tabs: Vec::new(),
+            shutdown_settings: Arc::new(Mutex::new(None)),
             theme_cycle_requested: false,
             dialog_was_open: false,
             drop_zones: Vec::new(),
@@ -419,6 +481,8 @@ impl LumenApp {
         app.sidebar.pc_open = app.settings.this_pc_expanded;
         app.reload_sidebar();
         app.apply_folder_view();
+        let snap = app.settings_snapshot();
+        app.update_shutdown_settings(&snap);
         app
     }
 
@@ -500,6 +564,192 @@ impl LumenApp {
         self.active().location.path.clone()
     }
 
+    pub(crate) fn has_modal_overlay(&self) -> bool {
+        self.settings_open || self.quick_look.is_some() || self.dialog.is_some()
+    }
+
+    pub(crate) fn has_blocking_overlay(&self) -> bool {
+        self.has_modal_overlay() || self.ctx_menu.is_some() || self.menu_anchor.is_some() || self.crumb_menu.is_some()
+    }
+
+    pub(crate) fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub(crate) fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub(crate) fn set_focus_secondary(&mut self, secondary: bool) {
+        let secondary = secondary && self.secondary_tab.is_some();
+        if self.focus_secondary == secondary {
+            return;
+        }
+        self.save_active_search_snapshot();
+        self.focus_secondary = secondary;
+        self.rename = None;
+        self.typed.buf.clear();
+        self.restore_active_search_snapshot();
+        self.sync_watch();
+    }
+
+    fn has_tab_uid(&self, uid: u64) -> bool {
+        self.tabs.iter().any(|t| t.uid == uid) || self.secondary_tab.as_ref().is_some_and(|t| t.uid == uid)
+    }
+
+    pub(crate) fn tab_by_uid_mut(&mut self, uid: u64) -> Option<&mut Tab> {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.uid == uid) {
+            return Some(tab);
+        }
+        self.secondary_tab.as_mut().filter(|t| t.uid == uid)
+    }
+
+    pub(crate) fn visible_tab_for_dir_mut(&mut self, dir: &Path) -> Option<&mut Tab> {
+        let focus_secondary = self.focus_secondary;
+        if focus_secondary {
+            if self
+                .secondary_tab
+                .as_ref()
+                .and_then(|t| t.location.path.as_deref())
+                .is_some_and(|p| same_dir_path(p, dir))
+            {
+                return self.secondary_tab.as_mut();
+            }
+            let idx = self.active.min(self.tabs.len().saturating_sub(1));
+            if self.tabs.get(idx).and_then(|t| t.location.path.as_deref()).is_some_and(|p| same_dir_path(p, dir)) {
+                return self.tabs.get_mut(idx);
+            }
+        } else {
+            let idx = self.active.min(self.tabs.len().saturating_sub(1));
+            if self.tabs.get(idx).and_then(|t| t.location.path.as_deref()).is_some_and(|p| same_dir_path(p, dir)) {
+                return self.tabs.get_mut(idx);
+            }
+            if self
+                .secondary_tab
+                .as_ref()
+                .and_then(|t| t.location.path.as_deref())
+                .is_some_and(|p| same_dir_path(p, dir))
+            {
+                return self.secondary_tab.as_mut();
+            }
+        }
+        None
+    }
+
+    pub(crate) fn save_active_search_snapshot(&mut self) {
+        let uid = self.last_focused_tab_uid;
+        if !self.has_tab_uid(uid) {
+            self.tab_search.remove(&uid);
+            return;
+        }
+        let empty = self.search.query.is_empty()
+            && self.search.last_query.is_empty()
+            && self.search.typed_text.is_empty()
+            && self.search.root.is_none();
+        if empty {
+            self.tab_search.remove(&uid);
+        } else {
+            self.tab_search.insert(
+                uid,
+                TabSearchSnapshot {
+                    query: self.search.query.clone(),
+                    root: self.search.root.clone(),
+                    last_query: self.search.last_query.clone(),
+                    typed_text: self.search.typed_text.clone(),
+                },
+            );
+        }
+    }
+
+    pub(crate) fn restore_active_search_snapshot(&mut self) {
+        let uid = self.active().uid;
+        self.last_focused_tab_uid = uid;
+        let snap = self.tab_search.get(&uid).cloned().unwrap_or_default();
+        self.search.query = snap.query;
+        self.search.root = snap.root;
+        self.search.last_query = snap.last_query;
+        self.search.typed_text = snap.typed_text;
+        self.search.typed_at = 0.0;
+        self.search.running = self.search_owner_uid == Some(uid) && self.search.engine.is_running();
+    }
+
+    /// Detects pane/tab focus changes (including direct `focus_secondary` flips from
+    /// UI code) and swaps per-tab `SearchUi` state while clearing transient input state.
+    pub(crate) fn sync_active_tab_focus(&mut self) {
+        let current_uid = self.active().uid;
+        if current_uid == self.last_focused_tab_uid {
+            return;
+        }
+        self.save_active_search_snapshot();
+        self.typed.buf.clear();
+        self.rename = None;
+        self.restore_active_search_snapshot();
+    }
+
+    /// Re-aligns `rename.row` to `rename.target_path` after an asynchronous listing
+    /// or re-sort lands; cancels inline rename if the target disappeared.
+    pub(crate) fn reconcile_rename_row(&mut self) {
+        let Some(target) = self.rename.as_ref().map(|r| r.target_path.clone()) else { return };
+        if let Some(new_row) = self
+            .active()
+            .entries
+            .iter()
+            .position(|e| e.path.as_deref().is_some_and(|p| p.as_os_str().eq_ignore_ascii_case(target.as_os_str())))
+        {
+            if let Some(rename) = self.rename.as_mut() {
+                rename.row = new_row;
+            }
+        } else {
+            self.rename = None;
+        }
+    }
+
+    pub(crate) fn flush_pending_refresh(&mut self) {
+        if self.pending_refresh && self.rename.is_none() {
+            self.pending_refresh = false;
+            self.last_watch_refresh = now();
+            self.reload_active();
+        }
+    }
+
+    pub(crate) fn reload_visible_panes(&mut self) {
+        let (hidden, system) = (self.show_hidden, self.show_system);
+        self.rename = None;
+        let idx = self.active.min(self.tabs.len().saturating_sub(1));
+        if let Some(primary) = self.tabs.get_mut(idx) {
+            primary.refresh(hidden, system);
+        }
+        if let Some(sec) = self.secondary_tab.as_mut() {
+            sec.refresh(hidden, system);
+        }
+    }
+
+    /// Drops any background folder-size scan once the Details pane is closed or
+    /// the active selection no longer matches the scanned directory.
+    pub(crate) fn prune_stale_folder_size(&mut self) {
+        let Some(job_path) = self.folder_size.as_ref().map(|j| j.path.clone()) else { return };
+        let keep = self.details_visible && {
+            let tab = self.active();
+            tab.selection.len() == 1
+                && tab.selection.iter().next().and_then(|&idx| tab.entries.get(idx)).is_some_and(|entry| {
+                    entry.is_folder
+                        && entry
+                            .path
+                            .as_deref()
+                            .is_some_and(|p| p.as_os_str().eq_ignore_ascii_case(job_path.as_os_str()))
+                })
+        };
+        if !keep {
+            self.folder_size = None;
+        }
+    }
+
+    fn update_shutdown_settings(&self, snapshot: &Settings) {
+        if let Ok(mut slot) = self.shutdown_settings.lock() {
+            *slot = Some(snapshot.clone());
+        }
+    }
+
     pub(crate) fn is_cut(&self, path: Option<&std::path::Path>) -> bool {
         let Some(path) = path else { return false };
         if self.cut_paths.is_empty() {
@@ -536,6 +786,7 @@ impl LumenApp {
 
     pub(crate) fn navigate_to(&mut self, location: Location) {
         self.rename = None;
+        self.typed.buf.clear();
         self.stop_search();
         self.icons.bump_generation();
         let (hidden, system) = (self.show_hidden, self.show_system);
@@ -545,6 +796,7 @@ impl LumenApp {
     }
 
     pub(crate) fn sync_watch(&mut self) {
+        self.sync_active_tab_focus();
         self.watcher.watch(self.current_dir());
     }
 
@@ -557,6 +809,7 @@ impl LumenApp {
     pub(crate) fn go_back_active(&mut self) {
         let (hidden, system) = (self.show_hidden, self.show_system);
         self.rename = None;
+        self.typed.buf.clear();
         self.stop_search();
         self.icons.bump_generation();
         self.active_mut().go_back(hidden, system);
@@ -567,6 +820,7 @@ impl LumenApp {
     pub(crate) fn go_forward_active(&mut self) {
         let (hidden, system) = (self.show_hidden, self.show_system);
         self.rename = None;
+        self.typed.buf.clear();
         self.stop_search();
         self.icons.bump_generation();
         self.active_mut().go_forward(hidden, system);
@@ -577,6 +831,7 @@ impl LumenApp {
     pub(crate) fn go_up_active(&mut self) {
         let (hidden, system) = (self.show_hidden, self.show_system);
         self.rename = None;
+        self.typed.buf.clear();
         self.stop_search();
         self.icons.bump_generation();
         self.active_mut().go_up(hidden, system);
@@ -657,42 +912,13 @@ impl LumenApp {
     /// Applies the remembered view settings for the folder we just entered.
     /// Only differences are applied so switching back to a tab keeps its selection.
     fn apply_folder_view(&mut self) {
-        let Some(path) = self.current_dir() else { return };
-        let Some(view) = self
-            .settings
-            .folders
-            .iter()
-            .find(|(key, _)| crate::core::settings::same_path(key, &path))
-            .map(|(_, view)| view.clone())
-        else {
-            return;
-        };
-        let sort_key = parse_sort_key(&view.sort_key);
-        let group_by = view.group_by.as_deref().and_then(parse_sort_key);
-        let tab = self.active_mut();
-        let mut resort = false;
-        let mut rebuild = false;
-        if let Some(mode) = parse_view_mode(&view.view) {
-            tab.view = mode;
-        }
-        if let Some(key) = sort_key
-            && (tab.sort.key != key || tab.sort.ascending != view.sort_ascending)
-        {
-            tab.sort.key = key;
-            tab.sort.ascending = view.sort_ascending;
-            resort = true;
-        }
-        if tab.col_widths != view.col_widths {
-            tab.col_widths = view.col_widths;
-        }
-        if tab.group_by != group_by {
-            tab.group_by = group_by;
-            rebuild = true;
-        }
-        if resort {
-            tab.resort();
-        } else if rebuild {
-            tab.rebuild_display();
+        if self.focus_secondary {
+            if let Some(sec) = self.secondary_tab.as_mut() {
+                apply_folder_view_to_tab(&self.settings, sec);
+            }
+        } else {
+            let index = self.active.min(self.tabs.len() - 1);
+            apply_folder_view_to_tab(&self.settings, &mut self.tabs[index]);
         }
     }
 
@@ -773,29 +999,25 @@ impl LumenApp {
             return;
         }
         let snapshot = self.settings_snapshot();
-        let Ok(json) = serde_json::to_string(&snapshot) else { return };
+        self.update_shutdown_settings(&snapshot);
+        let Ok(json) = serde_json::to_string(&snapshot) else {
+            self.last_save = now();
+            return;
+        };
         if json == self.save_fingerprint {
+            self.last_save = now();
             self.settings = snapshot;
             return;
         }
         if settings::save(&snapshot).is_ok() {
             self.save_fingerprint = json;
-            self.last_save = now();
         }
+        self.last_save = now();
         self.settings = snapshot;
     }
 
     fn save_window_state(&self) {
-        let mut state = crate::core::windowstate::load();
-        state.maximized = platform::is_maximized();
-        if let Some((x, y, w, h)) = platform::window_logical_rect() {
-            state.x = Some(x);
-            state.y = Some(y);
-            state.w = Some(w);
-            state.h = Some(h);
-            state.logical = true;
-        }
-        crate::core::windowstate::save(&state);
+        save_window_state_now();
     }
 
     pub(crate) fn status_metrics(&self) -> (usize, usize, u64, u64) {
@@ -808,8 +1030,22 @@ impl LumenApp {
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         crate::ui::spring::begin_frame(self.settings.spring_animations);
+        for uid in self.pending_spring_clear_tabs.drain(..) {
+            for pane_tag in [0u8, 1u8] {
+                crate::ui::spring::clear(&ctx, egui::Id::unique(("list-scroll-spring", pane_tag, uid)));
+                crate::ui::spring::clear(&ctx, egui::Id::unique(("details-sel-bar-y", pane_tag, uid)));
+                crate::ui::spring::clear(&ctx, egui::Id::unique(("pane-enter", pane_tag, uid)));
+            }
+            crate::ui::spring::clear(&ctx, egui::Id::unique(("list-scroll-spring", uid)));
+            crate::ui::spring::clear(&ctx, egui::Id::unique(("details-sel-bar-y", uid)));
+            crate::ui::spring::clear(&ctx, egui::Id::unique(("pane-enter", uid)));
+        }
         // When tray-resident mode is active, closing the window hides it to the
-        // notification area instead of exiting (unless Quit was chosen from tray).
+        // notification area instead of exiting (unless Quit was chosen from tray,
+        // requested via `--quit` IPC, or triggered by Windows session shutdown).
+        if platform::force_quit_requested() {
+            self.force_quit = true;
+        }
         if self.settings.tray_resident && !self.force_quit && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             platform::hide_to_tray();
@@ -821,6 +1057,10 @@ impl LumenApp {
         }
         self.poll_background(&ctx);
         self.handle_input(&ctx);
+        self.sync_active_tab_focus();
+
+        let overlay_blocking = self.has_blocking_overlay() || crate::ui::overlays::overlay_has_keyboard(&ctx);
+        platform::set_modal_active(overlay_blocking);
 
         let full = ui.max_rect();
         let titlebar = Rect::from_min_size(full.min, Vec2::new(full.width(), theme::TITLEBAR_H));
@@ -834,21 +1074,6 @@ impl LumenApp {
         );
         let body = Rect::from_min_max(Pos2::new(full.left(), command.bottom()), Pos2::new(full.right(), status.top()));
 
-        let painter = ui.painter().clone();
-        if self.settings.mica_backdrop {
-            // Let Windows 11 DWM Mica shine through the chrome with a subtle tint.
-            let tint = if self.dark {
-                egui::Color32::from_rgba_unmultiplied(24, 25, 30, 145)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(246, 247, 250, 155)
-            };
-            painter.rect_filled(full, egui::CornerRadius::ZERO, tint);
-        } else {
-            widgets::vertical_gradient(&painter, full, self.theme.bg_top, self.theme.bg_bottom);
-            widgets::radial_glow(&painter, Pos2::new(full.left() + 120.0, full.top() - 140.0), 640.0, self.theme.glow);
-        }
-
-        let nav = Rect::from_min_size(body.min + Vec2::new(theme::PANE_GAP, 0.0), Vec2::new(self.nav_w, body.height()));
         let details_t = crate::ui::spring::animate(
             &ctx,
             egui::Id::unique("details-pane-open"),
@@ -857,12 +1082,58 @@ impl LumenApp {
             crate::ui::spring::PANEL,
         )
         .clamp(0.0, 1.0);
-        let details_w = self.details_w * details_t;
-        let content_right = body.right() - theme::PANE_GAP - details_w;
-        let card = Rect::from_min_max(
-            Pos2::new(nav.right() + theme::PANE_GAP, body.top()),
-            Pos2::new(content_right, body.bottom()),
+        let split_t = crate::ui::spring::animate(
+            &ctx,
+            egui::Id::unique("split-pane-open"),
+            if self.secondary_tab.is_some() { 1.0 } else { 0.0 },
+            if self.secondary_tab.is_some() { 1.0 } else { 0.0 },
+            crate::ui::spring::PANEL,
+        )
+        .clamp(0.0, 1.0);
+        let layout = compute_body_layout(
+            body,
+            self.nav_w,
+            self.details_w,
+            details_t,
+            self.secondary_tab.is_some(),
+            split_t,
+            self.split_ratio,
         );
+
+        let painter = ui.painter().clone();
+        if self.settings.mica_backdrop {
+            // Let Windows 11 DWM Mica shine through while painting frosted backing
+            // fills and subtle hairlines behind chrome, sidebar, and statusbar so
+            // labels and dividers stay legible over bright/high-contrast wallpapers.
+            painter.rect_filled(full, egui::CornerRadius::ZERO, self.theme.mica_tint);
+            let chrome_rect = Rect::from_min_max(titlebar.min, command.max);
+            painter.rect_filled(chrome_rect, egui::CornerRadius::ZERO, self.theme.mica_chrome_bg);
+            painter.line_segment(
+                [Pos2::new(full.left(), command.bottom()), Pos2::new(full.right(), command.bottom())],
+                egui::Stroke::new(1.0, self.theme.mica_subtle_border),
+            );
+            if layout.nav.width() > 24.0 {
+                painter.rect_filled(
+                    layout.nav,
+                    egui::CornerRadius::same(theme::RADIUS_CARD),
+                    self.theme.mica_sidebar_bg,
+                );
+                widgets::stroke_rect(
+                    &painter,
+                    layout.nav,
+                    theme::RADIUS_CARD,
+                    egui::Stroke::new(1.0, self.theme.mica_subtle_border),
+                );
+            }
+            painter.rect_filled(status, egui::CornerRadius::ZERO, self.theme.mica_status_bg);
+            painter.line_segment(
+                [Pos2::new(full.left(), status.top()), Pos2::new(full.right(), status.top())],
+                egui::Stroke::new(1.0, self.theme.mica_subtle_border),
+            );
+        } else {
+            widgets::vertical_gradient(&painter, full, self.theme.bg_top, self.theme.bg_bottom);
+            widgets::radial_glow(&painter, Pos2::new(full.left() + 120.0, full.top() - 140.0), 640.0, self.theme.glow);
+        }
 
         let want_ime = self.address.editing
             || self.rename.is_some()
@@ -876,52 +1147,45 @@ impl LumenApp {
         self.pin_drop_rect = None;
         self.paint_titlebar(ui, titlebar);
         self.paint_command_bar(ui, command);
-        self.paint_sidebar(ui, nav);
-        let split_t = crate::ui::spring::animate(
-            &ctx,
-            egui::Id::unique("split-pane-open"),
-            if self.secondary_tab.is_some() { 1.0 } else { 0.0 },
-            if self.secondary_tab.is_some() { 1.0 } else { 0.0 },
-            crate::ui::spring::PANEL,
-        )
-        .clamp(0.0, 1.0);
-        if self.secondary_tab.is_some() && split_t > 0.03 {
-            let total_w = (card.width() - theme::PANE_GAP).max(200.0);
-            let target_left = (total_w * self.split_ratio).clamp(180.0, (total_w - 180.0).max(180.0));
-            let left_w = (card.width() + (target_left - card.width()) * split_t).clamp(160.0, card.width());
-            let left_card = Rect::from_min_size(card.min, Vec2::new(left_w, card.height()));
-            let right_left = (left_card.right() + theme::PANE_GAP).min(card.right());
-            let right_card = Rect::from_min_max(Pos2::new(right_left, card.top()), card.max);
-            self.paint_content(ui, left_card, false);
+        if layout.nav.width() > 24.0 {
+            self.paint_sidebar(ui, layout.nav);
+        }
+        if let (Some(left_card), Some(right_card)) = (layout.split_left, layout.split_right) {
+            if left_card.width() > 24.0 {
+                let mut left_ui = ui.new_child(egui::UiBuilder::new().max_rect(left_card));
+                left_ui.set_clip_rect(left_card);
+                self.paint_content(&mut left_ui, left_card, false);
+            }
             if right_card.width() > 24.0 {
                 let mut right_ui = ui.new_child(egui::UiBuilder::new().max_rect(right_card));
                 right_ui.set_clip_rect(right_card);
                 self.paint_content(&mut right_ui, right_card, true);
             }
-            let pane_split = Rect::from_min_max(
-                Pos2::new(left_card.right() - 2.0, card.top()),
-                Pos2::new(right_card.left() + 2.0, card.bottom()),
-            );
-            let sresp = ui.interact(pane_split, egui::Id::unique("dual-pane-splitter"), egui::Sense::drag());
-            if sresp.hovered() || sresp.dragged() {
-                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            if !overlay_blocking {
+                let pane_split = Rect::from_min_max(
+                    Pos2::new(left_card.right() - 2.0, layout.card.top()),
+                    Pos2::new(right_card.left() + 2.0, layout.card.bottom()),
+                );
+                let sresp = ui.interact(pane_split, egui::Id::unique("dual-pane-splitter"), egui::Sense::drag());
+                if sresp.hovered() || sresp.dragged() {
+                    ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if sresp.dragged() && layout.split_total_w > 0.0 {
+                    self.split_ratio =
+                        ((left_card.width() + sresp.drag_delta().x) / layout.split_total_w).clamp(0.25, 0.75);
+                    crate::ui::spring::set_immediate(&ctx, egui::Id::unique("split-pane-open"), 1.0);
+                }
             }
-            if sresp.dragged() && total_w > 0.0 {
-                self.split_ratio = ((left_w + sresp.drag_delta().x) / total_w).clamp(0.25, 0.75);
-                crate::ui::spring::set_immediate(&ctx, egui::Id::unique("split-pane-open"), 1.0);
-            }
-        } else {
-            self.paint_content(ui, card, false);
+        } else if layout.card.width() > 24.0 {
+            let mut main_ui = ui.new_child(egui::UiBuilder::new().max_rect(layout.card));
+            main_ui.set_clip_rect(layout.card);
+            self.paint_content(&mut main_ui, layout.card, false);
         }
-        if details_w > 12.0 {
-            let pane = Rect::from_min_max(
-                Pos2::new(content_right + theme::PANE_GAP, body.top()),
-                Pos2::new(body.right() - theme::PANE_GAP, body.bottom()),
-            );
+        if let Some(pane) = layout.details {
             let mut det_ui = ui.new_child(egui::UiBuilder::new().max_rect(pane));
             det_ui.set_clip_rect(pane);
             self.paint_details(&mut det_ui, pane);
-            if self.details_visible {
+            if self.details_visible && !overlay_blocking {
                 let det_split = Rect::from_min_max(
                     Pos2::new(pane.left() - 4.0, body.top()),
                     Pos2::new(pane.left() + 3.0, body.bottom()),
@@ -931,24 +1195,33 @@ impl LumenApp {
                     ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
                 if dresp.dragged() {
-                    self.details_w = (self.details_w - dresp.drag_delta().x).clamp(240.0, 560.0);
+                    self.details_w = (layout.eff_details_w - dresp.drag_delta().x).clamp(240.0, 560.0);
                     crate::ui::spring::set_immediate(&ctx, egui::Id::unique("details-pane-open"), 1.0);
                 }
             }
         }
+        if layout.nav.width() > 24.0 && !overlay_blocking {
+            let split_rect = Rect::from_min_max(
+                Pos2::new(layout.nav.right() - 3.0, body.top()),
+                Pos2::new(layout.nav.right() + 4.0, body.bottom()),
+            );
+            let response = ui.interact(split_rect, egui::Id::unique("nav-splitter"), egui::Sense::drag());
+            if response.hovered() || response.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if response.dragged() {
+                self.nav_w = (layout.eff_nav_w + response.drag_delta().x).clamp(180.0, 420.0);
+            }
+        }
         self.paint_status_bar(ui, status);
+        // Clear previous frame's suggestion rect right before overlays repaint it
+        // (after `paint_command_bar` had a chance to read it for lost-focus checks).
+        self.address_suggest_rect = None;
         self.paint_overlays(ui, full);
+        platform::set_modal_active(self.has_blocking_overlay() || crate::ui::overlays::overlay_has_keyboard(&ctx));
+        crate::shell::dnd::set_pin_drop_rect(self.pin_drop_rect);
         crate::shell::dnd::update_drop_context(&self.drop_zones, self.current_dir());
-
-        let split_rect =
-            Rect::from_min_max(Pos2::new(nav.right() - 3.0, body.top()), Pos2::new(nav.right() + 4.0, body.bottom()));
-        let response = ui.interact(split_rect, egui::Id::unique("nav-splitter"), egui::Sense::drag());
-        if response.hovered() || response.dragged() {
-            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-        }
-        if response.dragged() {
-            self.nav_w = (self.nav_w + response.drag_delta().x).clamp(180.0, 420.0);
-        }
+        self.prune_stale_folder_size();
 
         let title = if self.search_active() {
             format!("搜索 “{}” - Lumen", self.search.query)
@@ -962,30 +1235,198 @@ impl LumenApp {
 
         self.maybe_save();
 
-        // Repaint only while something is actually animating: icon uploads, the
-        // initial-load bar and toast fades. Background listings and search batches
-        // wake the loop themselves when they land.
-        let first_load = self.active().loading && self.active().entries.is_empty();
+        // Repaint only while something is actually animating: icon uploads, active
+        // pane loading bars, toast fades, or a pending search debounce / watcher flush.
+        let any_tab_loading = self.tabs.get(self.active).is_some_and(|t| t.loading)
+            || self.secondary_tab.as_ref().is_some_and(|t| t.loading);
         let ql_loading = self.quick_look.as_ref().is_some_and(|ql| ql.loading);
         let dir_sizing = self.folder_size.as_ref().is_some_and(|j| j.latest.as_ref().is_none_or(|r| !r.done));
+        let updating = matches!(
+            self.update_state,
+            crate::shell::updater::UpdateState::Checking { .. }
+                | crate::shell::updater::UpdateState::Downloading { .. }
+                | crate::shell::updater::UpdateState::Verifying { .. }
+        );
         let busy = self.icons.is_busy()
             || self.op_worker.is_busy()
-            || self.archive_rx.is_some()
+            || !self.archive_rxs.is_empty()
             || ql_loading
             || dir_sizing
+            || updating
             || !self.toasts.is_empty()
-            || first_load;
+            || any_tab_loading;
+        let search_debounce_remaining = if self.search_focused
+            && !self.search.query.trim().is_empty()
+            && self.search.last_query != self.search.query.trim()
+            && self.search.typed_at > 0.0
+        {
+            Some((0.36 - (now() - self.search.typed_at)).max(0.01))
+        } else {
+            None
+        };
         if crate::ui::spring::is_animating() {
             ctx.request_repaint();
         } else if busy {
             ctx.request_repaint_after(BUSY_REPAINT);
-        } else if self.pending_refresh && self.rename.is_none() {
-            // Wake exactly when the 700ms watcher throttle window elapses so the
-            // coalesced refresh is never stranded while idle.
-            let remaining = (0.72 - (now() - self.last_watch_refresh)).max(0.02);
-            ctx.request_repaint_after(Duration::from_secs_f64(remaining));
+        } else {
+            let mut next_wake: Option<f64> = search_debounce_remaining;
+            if self.pending_refresh && self.rename.is_none() {
+                // Wake exactly when the 700ms watcher throttle window elapses so the
+                // coalesced refresh is never stranded while idle.
+                let remaining = (0.72 - (now() - self.last_watch_refresh)).max(0.02);
+                next_wake = Some(match next_wake {
+                    Some(prev) => prev.min(remaining),
+                    None => remaining,
+                });
+            }
+            if let Some(secs) = next_wake {
+                ctx.request_repaint_after(Duration::from_secs_f64(secs));
+            }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BodyLayout {
+    nav: Rect,
+    card: Rect,
+    details: Option<Rect>,
+    eff_nav_w: f32,
+    eff_details_w: f32,
+    split_left: Option<Rect>,
+    split_right: Option<Rect>,
+    split_total_w: f32,
+}
+
+/// Computes the body pane rectangles while dynamically constraining effective
+/// `nav_w` and `details_w` on narrow windows (without mutating saved widths) so
+/// `card` stays usable and split-pane `f32::clamp` bounds can never invert.
+fn compute_body_layout(
+    body: Rect,
+    preferred_nav_w: f32,
+    preferred_details_w: f32,
+    details_t: f32,
+    split_active: bool,
+    split_t: f32,
+    split_ratio: f32,
+) -> BodyLayout {
+    let gap = theme::PANE_GAP;
+    let min_card_w = if split_active { 360.0 } else { 240.0 };
+    let side_budget = (body.width() - 3.0 * gap - min_card_w).max(0.0);
+
+    let mut eff_nav_w = preferred_nav_w.max(0.0);
+    let mut eff_details_w = (preferred_details_w * details_t.clamp(0.0, 1.0)).max(0.0);
+
+    if eff_nav_w + eff_details_w > side_budget {
+        let min_nav = 180.0f32.min(eff_nav_w);
+        let min_det = if eff_details_w > 12.0 { 200.0f32.min(eff_details_w) } else { 0.0 };
+        if eff_details_w > 0.0 && side_budget >= min_nav + min_det {
+            let excess = (eff_nav_w + eff_details_w) - side_budget;
+            let slack_det = (eff_details_w - min_det).max(0.0);
+            let slack_nav = (eff_nav_w - min_nav).max(0.0);
+            let total_slack = slack_det + slack_nav;
+            if total_slack > 0.0 {
+                let det_cut = (excess * (slack_det / total_slack)).min(slack_det);
+                let nav_cut = (excess - det_cut).min(slack_nav);
+                eff_details_w = (eff_details_w - det_cut).max(min_det);
+                eff_nav_w = (eff_nav_w - nav_cut).max(min_nav);
+            }
+        } else {
+            // Auto-collapse details first, then shrink nav to preserve the file pane.
+            eff_details_w = 0.0;
+            eff_nav_w = eff_nav_w.min(side_budget);
+        }
+    }
+
+    let body_h = body.height().max(0.0);
+    let nav = Rect::from_min_size(body.min + Vec2::new(gap, 0.0), Vec2::new(eff_nav_w, body_h));
+    let card_left = if eff_nav_w > 0.0 { nav.right() + gap } else { body.left() + gap };
+    let content_right = (body.right() - gap - eff_details_w).max(card_left);
+    let card = Rect::from_min_max(Pos2::new(card_left, body.top()), Pos2::new(content_right, body.bottom()));
+
+    let details = if eff_details_w > 12.0 {
+        let det_left = (content_right + gap).min(body.right() - gap);
+        let det_right = (body.right() - gap).max(det_left);
+        Some(Rect::from_min_max(Pos2::new(det_left, body.top()), Pos2::new(det_right, body.bottom())))
+    } else {
+        None
+    };
+
+    let (split_left, split_right, split_total_w) = if split_active && split_t > 0.03 {
+        let avail_split = (card.width() - gap).max(0.0);
+        let total_w = avail_split.max(1.0);
+        let target_min = 180.0f32.min(avail_split * 0.5);
+        let target_max = (avail_split - target_min).max(target_min);
+        let target_left = (avail_split * split_ratio).clamp(target_min, target_max);
+        let max_left = card.width().max(0.0);
+        let min_left = 160.0f32.min(max_left);
+        let left_w = (card.width() + (target_left - card.width()) * split_t).clamp(min_left, max_left);
+        let left_card = Rect::from_min_size(card.min, Vec2::new(left_w, card.height().max(0.0)));
+        let right_left = (left_card.right() + gap).min(card.right());
+        let right_card = Rect::from_min_max(Pos2::new(right_left, card.top()), card.max);
+        (Some(left_card), Some(right_card), total_w)
+    } else {
+        (None, None, 0.0)
+    };
+
+    BodyLayout { nav, card, details, eff_nav_w, eff_details_w, split_left, split_right, split_total_w }
+}
+
+pub(crate) fn apply_folder_view_to_tab(settings: &Settings, tab: &mut Tab) {
+    let Some(path) = tab.location.path.clone() else { return };
+    let Some(view) = settings
+        .folders
+        .iter()
+        .find(|(key, _)| crate::core::settings::same_path(key, &path))
+        .map(|(_, view)| view.clone())
+    else {
+        return;
+    };
+    let sort_key = parse_sort_key(&view.sort_key);
+    let group_by = view.group_by.as_deref().and_then(parse_sort_key);
+    let mut resort = false;
+    let mut rebuild = false;
+    if let Some(mode) = parse_view_mode(&view.view) {
+        tab.view = mode;
+    }
+    if let Some(key) = sort_key
+        && (tab.sort.key != key || tab.sort.ascending != view.sort_ascending)
+    {
+        tab.sort.key = key;
+        tab.sort.ascending = view.sort_ascending;
+        resort = true;
+    }
+    if tab.col_widths != view.col_widths {
+        tab.col_widths = view.col_widths;
+    }
+    if tab.group_by != group_by {
+        tab.group_by = group_by;
+        rebuild = true;
+    }
+    if resort {
+        tab.resort();
+    } else if rebuild {
+        tab.rebuild_display();
+    }
+}
+
+fn save_window_state_now() {
+    let mut state = crate::core::windowstate::load();
+    state.maximized = platform::is_maximized();
+    if let Some((x, y, w, h)) = platform::window_logical_rect() {
+        state.x = Some(x);
+        state.y = Some(y);
+        state.w = Some(w);
+        state.h = Some(h);
+        state.logical = true;
+    }
+    crate::core::windowstate::save(&state);
+}
+
+pub(crate) fn same_dir_path(a: &Path, b: &Path) -> bool {
+    let a = a.to_string_lossy();
+    let b = b.to_string_lossy();
+    a.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
 }
 
 impl eframe::App for LumenApp {
@@ -1084,13 +1525,17 @@ pub(crate) fn unique_name(dir: &std::path::Path, base: &str, ext: &str) -> Strin
         let tail = if n == 0 { String::new() } else { format!(" ({n})") };
         if ext.is_empty() { format!("{base}{tail}") } else { format!("{base}{tail}.{ext}") }
     };
-    for n in 0..10_000 {
+    let first = suffix(0);
+    if !dir.join(&first).exists() {
+        return first;
+    }
+    for n in 2..10_000 {
         let name = suffix(n);
         if !dir.join(&name).exists() {
             return name;
         }
     }
-    suffix(0)
+    first
 }
 
 pub(crate) fn entries_of_hits(hits: &[SearchHit]) -> Vec<Entry> {
@@ -1144,6 +1589,8 @@ pub(crate) fn sort_key_str(key: SortKey) -> &'static str {
         SortKey::Type => "type",
         SortKey::Size => "size",
         SortKey::Extension => "extension",
+        SortKey::FreeSpace => "free_space",
+        SortKey::Location => "location",
     }
 }
 
@@ -1155,6 +1602,8 @@ pub(crate) fn parse_sort_key(text: &str) -> Option<SortKey> {
         "type" => Some(SortKey::Type),
         "size" => Some(SortKey::Size),
         "extension" => Some(SortKey::Extension),
+        "free_space" => Some(SortKey::FreeSpace),
+        "location" => Some(SortKey::Location),
         _ => None,
     }
 }
@@ -1421,6 +1870,7 @@ mod tests {
 
     #[test]
     fn clipboard_shortcuts_copy_and_cut_files_with_navigation_pane_focus() {
+        let _clipboard = crate::shell::clipboard::CLIPBOARD_TEST_LOCK.lock().unwrap();
         let _com = Com::init();
         let stamp = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root =
@@ -1476,6 +1926,7 @@ mod tests {
 
     #[test]
     fn clipboard_shortcuts_keep_full_text_paste_in_text_editors() {
+        let _clipboard = crate::shell::clipboard::CLIPBOARD_TEST_LOCK.lock().unwrap();
         let _com = Com::init();
         let (mut app, ctx) = app_with(Vec::new());
         app.address.editing = true;
@@ -1592,5 +2043,296 @@ mod tests {
         assert!(app.secondary_tab.is_some());
         app.command(Command::ToggleSplitView);
         assert!(app.secondary_tab.is_none());
+    }
+
+    #[test]
+    fn recycle_bin_identifies_context_and_blocks_rename() {
+        let _com = Com::init();
+        let ctx = egui::Context::default();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut app = LumenApp::with_context(&ctx, settings_for(root));
+        assert!(!app.active().is_recycle_bin());
+
+        let bin = Location::known(&windows::Win32::UI::Shell::FOLDERID_RecycleBinFolder).expect("recycle bin");
+        assert!(bin.is_recycle_bin());
+        app.tabs[0] = Tab::new(bin, false, false);
+        app.active_mut().entries = std::sync::Arc::new(vec![entry("deleted.txt")]);
+        app.active_mut().rebuild_display();
+        app.active_mut().select_row(0, NONE);
+        assert!(app.active().is_recycle_bin());
+
+        app.command(Command::Rename);
+        assert!(app.rename.is_none(), "rename must be blocked inside Recycle Bin");
+        assert!(app.dialog.is_none(), "batch rename dialog must not open inside Recycle Bin");
+    }
+
+    /// BUG-01: narrow split-pane layout with wide nav & details panes must never
+    /// panic on `f32::clamp` and must keep preferred widths untouched.
+    #[test]
+    fn narrow_split_layout_never_panics_and_preserves_preferred_widths() {
+        let _com = Com::init();
+        for width in [820.0f32, 640.0, 300.0, 120.0, 0.0] {
+            let body = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 400.0));
+            let layout = compute_body_layout(body, 420.0, 560.0, 1.0, true, 1.0, 0.5);
+            if width >= 820.0 {
+                assert!(
+                    layout.card.width() >= 360.0,
+                    "split-pane card must stay >= 360px at {width}px, got {}",
+                    layout.card.width()
+                );
+            }
+            assert!(layout.card.width() >= 0.0);
+            let left = layout.split_left.expect("split left rect");
+            let right = layout.split_right.expect("split right rect");
+            assert!(left.width() >= 0.0 && right.width() >= 0.0);
+            assert!(left.right() <= layout.card.right() + 0.01);
+            assert!(right.right() <= layout.card.right() + 0.01);
+        }
+
+        // Also run a full `frame()` pass at 820px and 300px with max nav/details + split view.
+        let ctx = egui::Context::default();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut settings = settings_for(root);
+        settings.split_view = true;
+        settings.details_pane = true;
+        settings.nav_width = Some(420.0);
+        settings.details_width = Some(560.0);
+        let mut app = LumenApp::with_context(&ctx, settings);
+        app.nav_w = 420.0;
+        app.details_w = 560.0;
+        app.details_visible = true;
+
+        for win_w in [820.0f32, 300.0] {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(win_w, 520.0))),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                app.frame(ui);
+            });
+            output.textures_delta.clear();
+            assert_eq!(app.nav_w, 420.0, "preferred nav_w must not be mutated on narrow window");
+            assert_eq!(app.details_w, 560.0, "preferred details_w must not be mutated on narrow window");
+        }
+    }
+
+    /// BUG-06: `UndoEntry::Moved` undo/redo roundtrip must preserve `undo_stack`
+    /// and `redo_stack` without pushing reverse moves back to undo or clearing redo.
+    #[test]
+    fn undo_redo_move_roundtrip_preserves_stacks() {
+        use crate::shell::op_worker::{OpFinished, OpOrigin, OpResult};
+
+        let _com = Com::init();
+        let (mut app, _ctx) = app_with(vec![]);
+        let a = PathBuf::from("C:\\tmp\\dir_a\\f1.txt");
+        let b = PathBuf::from("C:\\tmp\\dir_b\\f1.txt");
+        let c = PathBuf::from("C:\\tmp\\dir_a\\f2.txt");
+        let d = PathBuf::from("C:\\tmp\\dir_b\\f2.txt");
+
+        // 1. Two normal moves push onto undo_stack.
+        app.apply_op_finished(OpFinished {
+            result: Ok(OpResult::Moved {
+                pairs: vec![(a.clone(), b.clone())],
+                clear_clipboard: false,
+                origin: OpOrigin::Normal,
+            }),
+        });
+        app.apply_op_finished(OpFinished {
+            result: Ok(OpResult::Moved {
+                pairs: vec![(c.clone(), d.clone())],
+                clear_clipboard: false,
+                origin: OpOrigin::Normal,
+            }),
+        });
+        assert_eq!(app.undo_stack.len(), 2);
+        assert!(app.redo_stack.is_empty());
+
+        // 2. Simulate undo of both moves: undo_stack pops, redo_stack accumulates,
+        //    and OpOrigin::Undo completions must NOT re-push to undo_stack or clear redo_stack.
+        app.undo_stack.pop();
+        app.redo_stack.push(UndoEntry::Moved { pairs: vec![(d.clone(), c.clone())] });
+        app.apply_op_finished(OpFinished {
+            result: Ok(OpResult::Moved {
+                pairs: vec![(d.clone(), c.clone())],
+                clear_clipboard: false,
+                origin: OpOrigin::Undo,
+            }),
+        });
+        assert_eq!(app.undo_stack.len(), 1, "OpOrigin::Undo must not push back onto undo_stack");
+        assert_eq!(app.redo_stack.len(), 1, "OpOrigin::Undo must preserve redo_stack");
+
+        app.undo_stack.pop();
+        app.redo_stack.push(UndoEntry::Moved { pairs: vec![(b.clone(), a.clone())] });
+        app.apply_op_finished(OpFinished {
+            result: Ok(OpResult::Moved {
+                pairs: vec![(b.clone(), a.clone())],
+                clear_clipboard: false,
+                origin: OpOrigin::Undo,
+            }),
+        });
+        assert!(app.undo_stack.is_empty());
+        assert_eq!(app.redo_stack.len(), 2);
+
+        // 3. Simulate redo of the first item: OpOrigin::Redo pushes back to undo_stack
+        //    WITHOUT clearing the remaining item in redo_stack!
+        app.redo_stack.pop();
+        app.apply_op_finished(OpFinished {
+            result: Ok(OpResult::Moved {
+                pairs: vec![(a.clone(), b.clone())],
+                clear_clipboard: false,
+                origin: OpOrigin::Redo,
+            }),
+        });
+        assert_eq!(app.undo_stack.len(), 1, "OpOrigin::Redo must restore entry to undo_stack");
+        assert_eq!(app.redo_stack.len(), 1, "OpOrigin::Redo must NOT clear remaining redo_stack entries");
+        assert!(app.toasts.last().is_some_and(|t| t.text == "已重做"));
+    }
+
+    /// BUG-14: after type-ahead expires (>0.9s), pressing `Space` must trigger
+    /// Quick Look instead of staying blocked forever.
+    #[test]
+    fn expired_type_ahead_allows_space_quick_look() {
+        let _com = Com::init();
+        let (mut app, ctx) = app_with(vec![entry("alpha.txt"), entry("bravo.txt")]);
+
+        type_text(&mut app, &ctx, "b");
+        assert_eq!(selected(&app), vec![1]);
+        assert_eq!(app.typed.buf, "b");
+
+        // Age the type-ahead timestamp past the 0.9s expiration window.
+        app.typed.at = now() - 1.2;
+
+        // Pressing Space should clear the expired buffer BEFORE handle_list_keys and open Quick Look.
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::ModifiersChanged(NONE));
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: NONE,
+        });
+        raw.events.push(egui::Event::Text(" ".to_string()));
+        let mut output = ctx.run_pass(raw, |ctx| app.handle_input(ctx));
+        output.textures_delta.clear();
+
+        assert!(app.typed.buf.is_empty(), "expired type-ahead buffer must be cleared before Space");
+        assert!(app.quick_look.is_some(), "Space must open Quick Look after type-ahead expires");
+    }
+
+    /// BUG-34: grouped & collapsed keyboard navigation must follow visible display
+    /// order and never focus or select entries inside collapsed groups.
+    #[test]
+    fn grouped_collapsed_keyboard_navigation_skips_hidden_entries() {
+        let _com = Com::init();
+        let (mut app, ctx) =
+            app_with(vec![entry("a1.txt"), entry("a2.txt"), entry("b1.txt"), entry("b2.txt"), entry("c1.txt")]);
+        app.active_mut().group_by = Some(SortKey::Name);
+        app.active_mut().rebuild_display();
+        app.active_mut().toggle_group("B");
+
+        // Visible entries should be [0 (a1), 1 (a2), 4 (c1)]; indices 2 & 3 are hidden in collapsed "B".
+        assert_eq!(app.active().visible_entry_indices(), vec![0, 1, 4]);
+
+        press(&mut app, &ctx, egui::Key::ArrowDown, NONE);
+        assert_eq!(selected(&app), vec![0]);
+        press(&mut app, &ctx, egui::Key::ArrowDown, NONE);
+        assert_eq!(selected(&app), vec![1]);
+        press(&mut app, &ctx, egui::Key::ArrowDown, NONE);
+        assert_eq!(selected(&app), vec![4], "ArrowDown must skip collapsed group B");
+        press(&mut app, &ctx, egui::Key::ArrowUp, NONE);
+        assert_eq!(selected(&app), vec![1], "ArrowUp must skip collapsed group B");
+
+        press(&mut app, &ctx, egui::Key::Home, NONE);
+        assert_eq!(selected(&app), vec![0]);
+        press(&mut app, &ctx, egui::Key::End, egui::Modifiers::SHIFT);
+        assert_eq!(selected(&app), vec![0, 1, 4], "Shift+End must select only visible entries");
+    }
+
+    /// BUG-08: `CloseTab` while secondary pane is focused closes the secondary pane
+    /// (preserving primary tabs), and per-tab `SearchUi` state survives tab switches.
+    #[test]
+    fn close_tab_closes_focused_secondary_pane_and_preserves_per_tab_search() {
+        let _com = Com::init();
+        let ctx = egui::Context::default();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut app = LumenApp::with_context(&ctx, settings_for(root));
+        let src = Location::from_path(&root.join("src")).expect("src dir");
+        app.tabs.push(Tab::new(src, false, false));
+        app.activate_tab(0);
+
+        // Open split view, focus secondary pane, and run CloseTab.
+        app.command(Command::ToggleSplitView);
+        assert!(app.secondary_tab.is_some());
+        let sec_uid = app.secondary_tab.as_ref().unwrap().uid;
+        app.set_focus_secondary(true);
+        assert!(app.focus_secondary);
+
+        app.command(Command::CloseTab);
+        assert!(app.secondary_tab.is_none(), "CloseTab on focused secondary pane must close secondary pane");
+        assert!(!app.focus_secondary);
+        assert_eq!(app.tabs.len(), 2, "primary tabs must remain intact");
+        assert!(app.pending_spring_clear_tabs.contains(&sec_uid));
+
+        // Per-tab SearchUi isolation: simulate search state on tab 0, switch to tab 1, then back.
+        let tab0_uid = app.tabs[0].uid;
+        app.tabs[0].set_search_results(vec![entry("hit.rs")], "hit".to_string());
+        app.search.query = "hit".to_string();
+        app.search.last_query = "hit".to_string();
+        app.search.typed_text = "hit".to_string();
+        app.search.root = Some(root.to_path_buf());
+        app.search_owner_uid = Some(tab0_uid);
+
+        app.activate_tab(1);
+        assert!(app.search.query.is_empty(), "switching to tab 1 must show tab 1's empty search box");
+        assert!(!app.active().is_search());
+        assert!(app.tabs[0].is_search(), "switching away must NOT destroy tab 0's search results");
+
+        // Finalizing search while on tab 1 must route strictly to tab 0 (owner), not tab 1.
+        app.finish_search();
+        assert!(!app.tabs[1].is_search());
+        assert!(app.tabs[0].is_search());
+
+        app.activate_tab(0);
+        assert_eq!(app.search.query, "hit", "returning to tab 0 must restore its SearchUi query");
+        assert_eq!(app.search.root, Some(root.to_path_buf()));
+        assert!(app.active().is_search());
+    }
+
+    /// BUG-02: inline rename must defer refresh on `apply_op_finished` while active
+    /// and reconcile `rename.row` by `target_path` if entries re-sort.
+    #[test]
+    fn rename_reconciles_target_path_and_defers_refresh_while_editing() {
+        use crate::shell::op_worker::{OpFinished, OpOrigin, OpResult};
+
+        let _com = Com::init();
+        let (mut app, _ctx) = app_with(vec![entry("alpha.txt"), entry("beta.txt"), entry("gamma.txt")]);
+        let beta_path = app.active().entries[1].path.clone().unwrap();
+        app.rename = Some(RenameState {
+            row: 1,
+            target_path: beta_path.clone(),
+            buf: "beta_renamed.txt".to_string(),
+            focus: false,
+            select_all: false,
+        });
+
+        // Simulate an earlier rename finishing while the user is already editing beta.txt (after Tab).
+        let dir = app.current_dir().unwrap();
+        app.apply_op_finished(OpFinished {
+            result: Ok(OpResult::Renamed {
+                from: dir.join("alpha.txt"),
+                to: dir.join("zeta.txt"),
+                origin: OpOrigin::Normal,
+                target_tab_uid: Some(app.active().uid),
+            }),
+        });
+        assert!(app.rename.is_some(), "active rename must NOT be wiped by earlier op completion");
+        assert!(app.pending_refresh, "refresh must be deferred while rename is open");
+
+        // Reorder entries so beta.txt moves from row 1 to row 0, then reconcile.
+        app.active_mut().entries = std::sync::Arc::new(vec![entry("beta.txt"), entry("gamma.txt"), entry("zeta.txt")]);
+        app.reconcile_rename_row();
+        assert_eq!(app.rename.as_ref().unwrap().row, 0, "rename.row must follow target_path after reorder");
+        assert_eq!(app.rename.as_ref().unwrap().target_path, beta_path);
     }
 }

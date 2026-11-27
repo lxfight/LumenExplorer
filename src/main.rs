@@ -11,7 +11,12 @@ use raw_window_handle::HasWindowHandle;
 
 fn main() -> eframe::Result {
     let cli = shell::ipc::parse_args(std::env::args().skip(1));
-    // Single-instance fast path: forward folder / `/select,` / Win+E requests
+    // Graceful shutdown signal for the installer/uninstaller (works even when hidden in tray).
+    if cli.quit {
+        let _ = shell::ipc::try_send_to_existing(&shell::ipc::LaunchTarget::Quit);
+        return Ok(());
+    }
+    // Single-instance fast path: forward folder / `/select,` requests
     // to the running primary Lumen window in < 15ms unless `--new-window` is set.
     if !cli.new_window && shell::ipc::try_send_to_existing(&cli.target) {
         return Ok(());
@@ -19,7 +24,10 @@ fn main() -> eframe::Result {
 
     platform::init_process();
 
-    let settings = core::settings::load();
+    let mut settings = core::settings::load();
+    if cli.start_background {
+        settings.tray_resident = true;
+    }
     let window_state = core::windowstate::load();
     let (x, y, width, height) = platform::clamp_logical_window(
         window_state.x,
@@ -37,7 +45,7 @@ fn main() -> eframe::Result {
         .with_transparent(settings.mica_backdrop)
         .with_visible(!cli.start_background)
         .with_has_shadow(true)
-        .with_maximized(window_state.maximized)
+        .with_maximized(window_state.maximized && !cli.start_background)
         .with_drag_and_drop(false);
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));

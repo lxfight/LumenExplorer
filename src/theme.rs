@@ -46,6 +46,10 @@ pub fn mono(size: f32) -> FontId {
 
 // ---- colors ----------------------------------------------------------------
 
+const WCAG_AA_TEXT: f32 = 4.5;
+const DARK_INK: Color32 = Color32::from_rgb(12, 16, 20);
+const LIGHT_INK: Color32 = Color32::WHITE;
+
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
@@ -56,8 +60,59 @@ fn lighten(c: Color32, t: f32) -> Color32 {
     mix(c, Color32::WHITE, t)
 }
 
-fn luminance(c: Color32) -> f32 {
-    (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0
+fn srgb_to_linear(channel: u8) -> f32 {
+    let c = channel as f32 / 255.0;
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+/// Relative luminance per WCAG 2.1 (sRGB linearized), in `[0.0, 1.0]`.
+pub fn luminance(c: Color32) -> f32 {
+    0.2126 * srgb_to_linear(c.r()) + 0.7152 * srgb_to_linear(c.g()) + 0.0722 * srgb_to_linear(c.b())
+}
+
+/// Contrast ratio per WCAG 2.1, in `[1.0, 21.0]`.
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let la = luminance(a);
+    let lb = luminance(b);
+    let (l1, l2) = if la >= lb { (la, lb) } else { (lb, la) };
+    (l1 + 0.05) / (l2 + 0.05)
+}
+
+/// Blends `color` minimally toward `target` until `contrast_ratio(result, against) >= min_ratio`.
+fn adjust_toward_contrast(color: Color32, target: Color32, against: Color32, min_ratio: f32) -> Color32 {
+    if contrast_ratio(color, against) >= min_ratio {
+        return color;
+    }
+    if contrast_ratio(target, against) < min_ratio {
+        return target;
+    }
+    let mut lo = 0.0f32;
+    let mut hi = 1.0f32;
+    for _ in 0..18 {
+        let mid = (lo + hi) * 0.5;
+        if contrast_ratio(mix(color, target, mid), against) >= min_ratio {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let candidate = mix(color, target, hi);
+    if contrast_ratio(candidate, against) >= min_ratio { candidate } else { target }
+}
+
+/// Picks the higher-contrast foreground ink (`WHITE` or `DARK_INK`) for `base`,
+/// and if even that ink is below WCAG AA (4.5:1), adaptively darkens or lightens
+/// `base` until `contrast_ratio(text_on_accent, accent) >= 4.5`.
+fn resolve_accent_pair(base: Color32) -> (Color32, Color32) {
+    let light_cr = contrast_ratio(LIGHT_INK, base);
+    let dark_cr = contrast_ratio(DARK_INK, base);
+    if light_cr >= dark_cr {
+        let accent = adjust_toward_contrast(base, Color32::BLACK, LIGHT_INK, WCAG_AA_TEXT);
+        (accent, LIGHT_INK)
+    } else {
+        let accent = adjust_toward_contrast(base, Color32::WHITE, DARK_INK, WCAG_AA_TEXT);
+        (accent, DARK_INK)
+    }
 }
 
 fn accent_from_abgr(abgr: u32) -> Color32 {
@@ -70,6 +125,8 @@ pub struct Theme {
     pub accent: Color32,
     pub accent_soft: Color32,
     pub accent_strong: Color32,
+    /// Accent color adjusted to meet WCAG AA (>= 4.5:1) when rendered as text on surfaces.
+    pub accent_text: Color32,
     pub text_on_accent: Color32,
 
     /// Content surface (file list card).
@@ -77,6 +134,14 @@ pub struct Theme {
     pub surface_alt: Color32,
     pub surface_raised: Color32,
     pub popup: Color32,
+
+    /// Frosted backing tokens for Windows 11 DWM Mica mode so chrome, sidebar,
+    /// status bar and subtle dividers stay legible over high-contrast wallpapers.
+    pub mica_tint: Color32,
+    pub mica_chrome_bg: Color32,
+    pub mica_sidebar_bg: Color32,
+    pub mica_status_bg: Color32,
+    pub mica_subtle_border: Color32,
 
     pub text: Color32,
     pub text_secondary: Color32,
@@ -105,20 +170,31 @@ impl Theme {
     pub fn new(dark: bool, accent_abgr: u32) -> Self {
         let raw = accent_from_abgr(accent_abgr);
         if dark {
-            let accent = if luminance(raw) < 0.45 { lighten(raw, 0.45) } else { raw };
+            let surface = Color32::from_rgb(0x20, 0x20, 0x20);
+            let surface_alt = Color32::from_rgb(0x1B, 0x1B, 0x1B);
+            let surface_raised = Color32::from_rgb(0x2A, 0x2A, 0x2A);
+            let lifted = if luminance(raw) < 0.22 { lighten(raw, 0.42) } else { raw };
+            let (accent, text_on_accent) = resolve_accent_pair(lifted);
+            let accent_text = adjust_toward_contrast(accent, Color32::WHITE, surface_raised, WCAG_AA_TEXT);
             Self {
                 dark,
                 accent,
                 accent_soft: Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 38),
                 accent_strong: lighten(accent, 0.18),
-                text_on_accent: Color32::from_rgb(12, 16, 20),
-                surface: Color32::from_rgb(0x20, 0x20, 0x20),
-                surface_alt: Color32::from_rgb(0x1B, 0x1B, 0x1B),
-                surface_raised: Color32::from_rgb(0x2A, 0x2A, 0x2A),
+                accent_text,
+                text_on_accent,
+                surface,
+                surface_alt,
+                surface_raised,
                 popup: Color32::from_rgb(0x2C, 0x2C, 0x2C),
+                mica_tint: Color32::from_rgba_unmultiplied(24, 25, 30, 175),
+                mica_chrome_bg: Color32::from_rgba_unmultiplied(28, 29, 34, 188),
+                mica_sidebar_bg: Color32::from_rgba_unmultiplied(30, 31, 36, 198),
+                mica_status_bg: Color32::from_rgba_unmultiplied(26, 27, 32, 192),
+                mica_subtle_border: Color32::from_rgba_unmultiplied(255, 255, 255, 34),
                 text: Color32::from_rgb(0xF2, 0xF2, 0xF2),
                 text_secondary: Color32::from_rgb(0xC2, 0xC2, 0xC2),
-                text_tertiary: Color32::from_rgb(0x94, 0x94, 0x94),
+                text_tertiary: Color32::from_rgb(0x9A, 0x9A, 0x9A),
                 text_disabled: Color32::from_rgb(0x67, 0x67, 0x67),
                 hover: Color32::from_rgba_unmultiplied(255, 255, 255, 14),
                 hover_strong: Color32::from_rgba_unmultiplied(255, 255, 255, 24),
@@ -137,21 +213,33 @@ impl Theme {
                 glow: Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 26),
             }
         } else {
-            let accent = if luminance(raw) > 0.62 { mix(raw, Color32::BLACK, 0.28) } else { raw };
+            let surface = Color32::from_rgb(0xFA, 0xFA, 0xFA);
+            let surface_alt = Color32::from_rgb(0xF3, 0xF3, 0xF3);
+            let surface_raised = Color32::WHITE;
+            let bg_bottom = Color32::from_rgb(0xEE, 0xEE, 0xF2);
+            let base = if luminance(raw) > 0.75 { mix(raw, Color32::BLACK, 0.25) } else { raw };
+            let (accent, text_on_accent) = resolve_accent_pair(base);
+            let accent_text = adjust_toward_contrast(accent, Color32::BLACK, bg_bottom, WCAG_AA_TEXT);
             Self {
                 dark,
                 accent,
                 accent_soft: Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 26),
                 accent_strong: mix(accent, Color32::BLACK, 0.12),
-                text_on_accent: Color32::WHITE,
-                surface: Color32::from_rgb(0xFA, 0xFA, 0xFA),
-                surface_alt: Color32::from_rgb(0xF3, 0xF3, 0xF3),
-                surface_raised: Color32::WHITE,
+                accent_text,
+                text_on_accent,
+                surface,
+                surface_alt,
+                surface_raised,
                 popup: Color32::from_rgb(0xF9, 0xF9, 0xF9),
+                mica_tint: Color32::from_rgba_unmultiplied(246, 247, 250, 185),
+                mica_chrome_bg: Color32::from_rgba_unmultiplied(248, 249, 252, 198),
+                mica_sidebar_bg: Color32::from_rgba_unmultiplied(250, 251, 253, 210),
+                mica_status_bg: Color32::from_rgba_unmultiplied(246, 247, 250, 200),
+                mica_subtle_border: Color32::from_rgba_unmultiplied(0, 0, 0, 34),
                 text: Color32::from_rgb(0x1A, 0x1A, 0x1A),
-                text_secondary: Color32::from_rgb(0x5C, 0x5C, 0x5C),
-                text_tertiary: Color32::from_rgb(0x86, 0x86, 0x86),
-                text_disabled: Color32::from_rgb(0xA8, 0xA8, 0xA8),
+                text_secondary: Color32::from_rgb(0x52, 0x52, 0x52),
+                text_tertiary: Color32::from_rgb(0x6E, 0x6E, 0x6E),
+                text_disabled: Color32::from_rgb(0x9E, 0x9E, 0x9E),
                 hover: Color32::from_rgba_unmultiplied(0, 0, 0, 10),
                 hover_strong: Color32::from_rgba_unmultiplied(0, 0, 0, 18),
                 pressed: Color32::from_rgba_unmultiplied(0, 0, 0, 8),
@@ -165,7 +253,7 @@ impl Theme {
                 scrollbar_hover: Color32::from_rgba_unmultiplied(0, 0, 0, 100),
                 shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 70),
                 bg_top: Color32::from_rgb(0xF7, 0xF7, 0xF9),
-                bg_bottom: Color32::from_rgb(0xEE, 0xEE, 0xF2),
+                bg_bottom,
                 glow: Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 18),
             }
         }
@@ -290,7 +378,7 @@ pub fn install_fonts(ctx: &egui::Context) {
             }
         }
     }
-    if let Some(bytes) = read_font("SegoeIcons.ttf") {
+    if let Some(bytes) = read_font("SegoeIcons.ttf").or_else(|| read_font("segmdl2.ttf")) {
         push(&mut fonts, FONT_ICONS, bytes, None);
     }
     if let Some(bytes) = read_font("CascadiaMono.ttf").or_else(|| read_font("consola.ttf")) {
@@ -349,13 +437,21 @@ pub fn install_fonts(ctx: &egui::Context) {
 
     fonts.families.insert(FontFamily::Name(FONT_SEMIBOLD.into()), semibold_family);
     fonts.families.insert(FontFamily::Name(FONT_BOLD.into()), bold_family);
-    fonts.families.insert(FontFamily::Name(FONT_ICONS.into()), vec![FONT_ICONS.to_owned()]);
+    if fonts.font_data.contains_key(FONT_ICONS) {
+        fonts.families.insert(FontFamily::Name(FONT_ICONS.into()), vec![FONT_ICONS.to_owned()]);
+    } else {
+        fonts.families.insert(FontFamily::Name(FONT_ICONS.into()), latin.clone());
+    }
     fonts.families.insert(FontFamily::Proportional, latin.clone());
 
     if fonts.font_data.contains_key(FONT_MONO) {
         let mut mono_family = vec![FONT_MONO.to_owned()];
-        mono_family.extend(latin.iter().skip(1).cloned());
+        if fonts.font_data.contains_key("cjk") {
+            mono_family.push("cjk".to_owned());
+        }
         fonts.families.insert(FontFamily::Monospace, mono_family);
+    } else if fonts.font_data.contains_key("cjk") {
+        fonts.families.entry(FontFamily::Monospace).or_default().push("cjk".to_owned());
     }
 
     ctx.set_fonts(fonts);
@@ -398,7 +494,7 @@ pub fn apply_style(ctx: &egui::Context, theme: &Theme) {
     visuals.faint_bg_color = theme.hover;
     visuals.selection.bg_fill = theme.selected;
     visuals.selection.stroke = Stroke::new(1.0, theme.accent);
-    visuals.hyperlink_color = theme.accent;
+    visuals.hyperlink_color = theme.accent_text;
     visuals.text_cursor.stroke = Stroke::new(1.5, theme.text);
     visuals.widgets.noninteractive.bg_fill = theme.surface;
     visuals.widgets.noninteractive.weak_bg_fill = theme.surface;
@@ -429,4 +525,74 @@ pub fn apply_style(ctx: &egui::Context, theme: &Theme) {
 
     style.visuals = visuals;
     ctx.set_style_of(kind, style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn abgr(r: u8, g: u8, b: u8) -> u32 {
+        (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+    }
+
+    #[test]
+    fn wcag_luminance_and_contrast_match_spec() {
+        assert!((luminance(Color32::BLACK) - 0.0).abs() < 1e-6);
+        assert!((luminance(Color32::WHITE) - 1.0).abs() < 1e-6);
+        assert!((contrast_ratio(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 1e-3);
+        assert!((contrast_ratio(Color32::WHITE, Color32::BLACK) - 21.0).abs() < 1e-3);
+        assert!((contrast_ratio(Color32::from_rgb(0x00, 0xCC, 0x6A), Color32::WHITE) - 2.13).abs() < 0.05);
+    }
+
+    #[test]
+    fn theme_accents_meet_wcag_aa_in_light_and_dark() {
+        let accents = [
+            ("win_blue", abgr(0x00, 0x78, 0xD4)),
+            ("mint", abgr(0x00, 0xCC, 0x6A)),
+            ("gold", abgr(0xFF, 0xB9, 0x00)),
+            ("mid_gray", abgr(0x77, 0x77, 0x77)),
+            ("mid_orange", abgr(0xD9, 0x6B, 0x27)),
+            ("dark_red", abgr(0xA8, 0x00, 0x00)),
+            ("pure_black", abgr(0x00, 0x00, 0x00)),
+            ("pure_white", abgr(0xFF, 0xFF, 0xFF)),
+        ];
+        for dark in [false, true] {
+            for (name, color) in accents {
+                let t = Theme::new(dark, color);
+                let on_accent = contrast_ratio(t.text_on_accent, t.accent);
+                assert!(
+                    on_accent >= WCAG_AA_TEXT,
+                    "dark={dark} accent={name}: text_on_accent contrast {on_accent:.2} < 4.5"
+                );
+                let on_surface = contrast_ratio(t.accent_text, t.surface);
+                assert!(
+                    on_surface >= WCAG_AA_TEXT,
+                    "dark={dark} accent={name}: accent_text on surface contrast {on_surface:.2} < 4.5"
+                );
+                let on_alt = contrast_ratio(t.accent_text, t.surface_alt);
+                assert!(
+                    on_alt >= WCAG_AA_TEXT,
+                    "dark={dark} accent={name}: accent_text on surface_alt contrast {on_alt:.2} < 4.5"
+                );
+                assert!(t.mica_chrome_bg.a() > 160 && t.mica_sidebar_bg.a() > 180 && t.mica_status_bg.a() > 170);
+                assert!(t.mica_subtle_border.a() >= 30);
+            }
+        }
+    }
+
+    #[test]
+    fn install_fonts_registers_icons_and_monospace_cjk_fallback() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let mut output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            let families = ctx.fonts(|fonts| {
+                let mono = fonts.families().into_iter().any(|f| f == FontFamily::Monospace);
+                let icons = fonts.families().into_iter().any(|f| f == FontFamily::Name(FONT_ICONS.into()));
+                (mono, icons)
+            });
+            assert!(families.0, "Monospace family must be registered");
+            assert!(families.1, "Icons family must be registered");
+        });
+        output.textures_delta.clear();
+    }
 }

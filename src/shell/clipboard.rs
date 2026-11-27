@@ -28,6 +28,10 @@ fn preferred_effect_format() -> u32 {
 
 static CLIPBOARD_LOCK: Mutex<()> = Mutex::new(());
 
+// A whole test transaction must own the desktop clipboard, beyond each API call.
+#[cfg(test)]
+pub(crate) static CLIPBOARD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 struct ClipboardGuard {
     _lock: MutexGuard<'static, ()>,
 }
@@ -139,16 +143,22 @@ fn hdrop_paths(handle: HANDLE) -> Vec<PathBuf> {
     paths
 }
 
-fn clipboard_preferred_effect() -> Option<u32> {
-    let handle = unsafe { GetClipboardData(preferred_effect_format()) }.ok()?;
-    let global = HGLOBAL(handle.0);
+fn read_hglobal_u32(global: HGLOBAL) -> Option<u32> {
+    if unsafe { GlobalSize(global) } < std::mem::size_of::<u32>() {
+        return None;
+    }
     let ptr = unsafe { GlobalLock(global) } as *const u32;
     if ptr.is_null() {
         return None;
     }
-    let effect = unsafe { ptr.read_unaligned() };
+    let value = unsafe { ptr.read_unaligned() };
     let _ = unsafe { GlobalUnlock(global) };
-    Some(effect)
+    Some(value)
+}
+
+fn clipboard_preferred_effect() -> Option<u32> {
+    let handle = unsafe { GetClipboardData(preferred_effect_format()) }.ok()?;
+    read_hglobal_u32(HGLOBAL(handle.0))
 }
 
 /// Places the selected files on the clipboard, optionally as a cut (move) operation.
@@ -344,6 +354,7 @@ mod tests {
 
     #[test]
     fn files_round_trip() {
+        let _clipboard = CLIPBOARD_TEST_LOCK.lock().unwrap();
         let dir = fixture_dir();
         let files = [dir.join("alpha.txt"), dir.join("测试 文件.txt")];
         for file in &files {
@@ -383,5 +394,24 @@ mod tests {
         assert_eq!(parse_clipboard_path("https://example.com"), None);
         assert_eq!(parse_clipboard_path("line1\nline2"), None);
         assert_eq!(parse_clipboard_path(r"Z:\NonExistent\LumenPath\12345"), None);
+    }
+
+    #[test]
+    fn read_hglobal_u32_rejects_undersized_blocks_and_reads_valid_u32() {
+        // 0-byte block (GlobalSize == 0) must return None instead of reading OOB.
+        let empty = unsafe { GlobalAlloc(GMEM_MOVEABLE, 0) }.expect("alloc 0");
+        assert_eq!(read_hglobal_u32(empty), None);
+        let _ = unsafe { GlobalFree(Some(empty)) };
+
+        // 2-byte block must return None when GlobalSize < 4.
+        let tiny = GlobalBuffer::copy(&[0x01, 0x02]).expect("alloc 2");
+        let tiny_h = tiny.0.unwrap();
+        if unsafe { GlobalSize(tiny_h) } < std::mem::size_of::<u32>() {
+            assert_eq!(read_hglobal_u32(tiny_h), None);
+        }
+
+        // Valid 4-byte block reads the exact u32.
+        let valid = GlobalBuffer::copy(&DROPEFFECT_MOVE.0.to_ne_bytes()).expect("alloc 4");
+        assert_eq!(read_hglobal_u32(valid.0.unwrap()), Some(DROPEFFECT_MOVE.0));
     }
 }

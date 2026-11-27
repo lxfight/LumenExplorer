@@ -72,6 +72,12 @@ pub struct Settings {
     pub compact_mode: bool,
     #[serde(default)]
     pub backspace_goes_back: bool,
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
+    #[serde(default)]
+    pub skipped_version: String,
+    #[serde(default)]
+    pub last_update_check: u64,
     #[serde(default)]
     pub search_backend: SearchBackend,
     #[serde(default)]
@@ -124,6 +130,9 @@ impl Default for Settings {
             show_checkboxes: false,
             compact_mode: false,
             backspace_goes_back: false,
+            auto_check_updates: true,
+            skipped_version: String::new(),
+            last_update_check: 0,
             search_backend: SearchBackend::Auto,
             details_width: None,
             split_view: false,
