@@ -15,13 +15,15 @@ pub(crate) enum SettingsTab {
     Integration,
     Search,
     Shortcuts,
+    Updates,
 }
 
-const NAV_TABS: [(SettingsTab, &str, &str); 4] = [
+const NAV_TABS: [(SettingsTab, &str, &str); 5] = [
     (SettingsTab::General, icons::VIEW, "常规与外观"),
     (SettingsTab::Integration, icons::OPEN_EXTERNAL, "桌面协同"),
     (SettingsTab::Search, icons::SEARCH, "搜索与文件"),
     (SettingsTab::Shortcuts, icons::INFO, "快捷键"),
+    (SettingsTab::Updates, icons::DOWNLOAD, "关于与更新"),
 ];
 
 impl LumenApp {
@@ -180,6 +182,7 @@ impl LumenApp {
                     SettingsTab::Integration => self.paint_settings_integration(ui, &t, w),
                     SettingsTab::Search => self.paint_settings_search(ui, &t, w),
                     SettingsTab::Shortcuts => paint_settings_shortcuts(ui, &t, w),
+                    SettingsTab::Updates => self.paint_settings_updates(ui, &t, w),
                 }
             },
         );
@@ -264,7 +267,33 @@ impl LumenApp {
     }
 
     fn paint_settings_integration(&mut self, ui: &mut egui::Ui, t: &Theme, w: f32) {
-        section_title(ui, t, "零注册表 · 安全共存与高效协同（不触发杀软误报）");
+        section_title(ui, t, "桌面集成与协同（主程序零注册表写入，可选系统集成由安装程序管理）");
+
+        let installed = crate::shell::integrate::is_installed();
+        let has_menu = crate::shell::integrate::has_context_menu();
+        let mode_line = if installed {
+            if has_menu {
+                "运行模式：安装版 · 右键「使用 Lumen 打开」已启用（不修改系统默认资源管理器）"
+            } else {
+                "运行模式：安装版 · 可重新运行安装程序按需勾选右键菜单 / PATH / 开机自启"
+            }
+        } else {
+            "运行模式：开发 / 便携模式 · 推荐使用正式安装包体验右键菜单、PATH 命令与安全卸载"
+        };
+        let (st_rect, _) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::hover());
+        let dot_color = if installed { Color32::from_rgb(0x10, 0x7C, 0x10) } else { t.accent };
+        ui.painter().circle_filled(Pos2::new(st_rect.left() + 8.0, st_rect.center().y), 4.0, dot_color);
+        widgets::text_left(
+            ui,
+            ui.painter(),
+            Rect::from_min_max(Pos2::new(st_rect.left() + 18.0, st_rect.top()), st_rect.max),
+            mode_line,
+            theme::font(11.5),
+            t.text_secondary,
+            0.0,
+        );
+        ui.add_space(4.0);
+
         if action_card(
             ui,
             t,
@@ -283,7 +312,7 @@ impl LumenApp {
             w,
             "set-tray",
             "关闭窗口时常驻系统托盘",
-            "隐藏窗口保持常驻以实现毫秒级呼出，配合固定任务栏日常使用更顺手（右键托盘可退出）",
+            "隐藏窗口保持常驻以实现毫秒级呼出，升级或卸载时会自动安全退出（右键托盘可退出）",
             self.settings.tray_resident,
         ) {
             self.command(Command::ToggleTrayResident);
@@ -306,11 +335,11 @@ impl LumenApp {
             w,
             "set-autostart",
             if is_auto {
-                "开机自启：已检测到启动文件夹快捷方式"
+                "开机自启：已启用（安装程序托管或启动文件夹快捷方式）"
             } else {
                 "打开 Windows 启动文件夹 (shell:startup)"
             },
-            "将 Lumen 快捷方式（可附 --background 参数）手动拖入启动文件夹即可，程序本身不写入注册表",
+            "可在安装向导中勾选「开机静默启动」，或手动将快捷方式（附 --background）放入启动文件夹",
             "打开目录",
         ) {
             self.command(Command::ToggleAutoStart);
@@ -373,6 +402,164 @@ impl LumenApp {
             self.command(Command::ToggleSystemFiles);
         }
     }
+
+    fn paint_settings_updates(&mut self, ui: &mut egui::Ui, t: &Theme, w: f32) {
+        use crate::core::format_size;
+        use crate::shell::updater::{CURRENT_VERSION, UpdateState};
+
+        section_title(ui, t, "关于 Lumen");
+        let mode_label =
+            if crate::shell::integrate::is_installed() { "Windows 安装版" } else { "开发 / 便携模式" };
+        if action_card(
+            ui,
+            t,
+            w,
+            "set-about-releases",
+            &format!("Lumen v{CURRENT_VERSION}（{mode_label}）"),
+            "Windows 11 现代极速文件工作台 · 基于 Rust + 原生 Shell COM 构建",
+            "打开发布页",
+        ) {
+            self.command(Command::OpenReleasesPage);
+        }
+
+        if toggle_card(
+            ui,
+            t,
+            w,
+            "set-auto-update",
+            "启动时自动检查更新",
+            "后台静默查询 GitHub Releases（每天最多一次，离线不打扰，安装前自动校验 SHA-256）",
+            self.settings.auto_check_updates,
+        ) {
+            self.settings.auto_check_updates = !self.settings.auto_check_updates;
+        }
+        ui.add_space(6.0);
+
+        section_title(ui, t, "版本更新");
+        match self.update_state.clone() {
+            UpdateState::Idle => {
+                if action_card(
+                    ui,
+                    t,
+                    w,
+                    "set-upd-check-idle",
+                    "检查新版本",
+                    "从 GitHub Releases 检查最新安装包，自动支持系统代理",
+                    "立即检查",
+                ) {
+                    self.command(Command::CheckUpdates);
+                }
+            }
+            UpdateState::Checking { .. } => {
+                status_banner(ui, t, w, t.accent, "正在连接 GitHub 检查新版本…", "使用系统 WinHTTP 代理配置");
+            }
+            UpdateState::UpToDate { .. } => {
+                if action_card(
+                    ui,
+                    t,
+                    w,
+                    "set-upd-uptodate",
+                    &format!("当前已是最新版本（v{CURRENT_VERSION}）"),
+                    "暂未发现更新的正式安装包",
+                    "重新检查",
+                ) {
+                    self.command(Command::CheckUpdates);
+                }
+            }
+            UpdateState::Available(info) => {
+                let size_str =
+                    if info.asset_size > 0 { format!(" · {}", format_size(info.asset_size)) } else { String::new() };
+                if action_card(
+                    ui,
+                    t,
+                    w,
+                    "set-upd-dl",
+                    &format!("发现新版本 v{}{size_str}", info.version),
+                    &format!("安装包：{}（将通过 SHA-256 完整性校验）", info.asset_name),
+                    "下载更新",
+                ) {
+                    self.command(Command::DownloadUpdate);
+                }
+                if !info.notes.trim().is_empty() {
+                    let preview: String = info.notes.lines().take(8).collect::<Vec<_>>().join("\n");
+                    let (box_rect, _) = ui.allocate_exact_size(Vec2::new(w, 126.0), Sense::hover());
+                    ui.painter().rect_filled(box_rect, CornerRadius::same(6), t.surface_alt);
+                    ui.painter().rect_stroke(
+                        box_rect,
+                        CornerRadius::same(6),
+                        Stroke::new(1.0, t.border),
+                        egui::StrokeKind::Inside,
+                    );
+                    let galley = widgets::galley(ui, &preview, theme::font(11.5), t.text_secondary, w - 24.0);
+                    let clip = box_rect.shrink2(Vec2::new(12.0, 10.0));
+                    ui.painter().with_clip_rect(clip).galley(clip.min, galley, t.text_secondary);
+                    ui.add_space(6.0);
+                }
+                if action_card(
+                    ui,
+                    t,
+                    w,
+                    "set-upd-skip",
+                    "暂不更新此版本",
+                    &format!("跳过 v{} 的自动提醒，直到更高版本发布", info.version),
+                    "跳过此版本",
+                ) {
+                    self.command(Command::SkipUpdateVersion);
+                }
+            }
+            UpdateState::Downloading { info, downloaded, total } => {
+                let pct = if total > 0 { ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0) } else { 0.0 };
+                let sub = if total > 0 {
+                    format!("{} / {} ({pct:.0}%)", format_size(downloaded), format_size(total))
+                } else {
+                    format!("已下载 {}", format_size(downloaded))
+                };
+                progress_banner(ui, t, w, &format!("正在下载 Lumen v{}…", info.version), &sub, (pct / 100.0) as f32);
+            }
+            UpdateState::Verifying { info } => {
+                progress_banner(
+                    ui,
+                    t,
+                    w,
+                    &format!("正在校验 Lumen v{} 安装包…", info.version),
+                    "正在核对 SHA-256 完整性摘要",
+                    1.0,
+                );
+            }
+            UpdateState::ReadyToInstall { info, .. } => {
+                let subtitle = if crate::shell::integrate::is_installed() {
+                    "已通过 SHA-256 校验；点击后将静默升级并自动重新启动 Lumen"
+                } else {
+                    "已通过 SHA-256 校验；点击后将打开安装向导并退出当前实例"
+                };
+                if action_card(
+                    ui,
+                    t,
+                    w,
+                    "set-upd-install",
+                    &format!("Lumen v{} 更新已就绪", info.version),
+                    subtitle,
+                    "立即安装",
+                ) {
+                    self.command(Command::InstallUpdate);
+                }
+            }
+            UpdateState::Error { message, .. } => {
+                status_banner(ui, t, w, Color32::from_rgb(0xC4, 0x2B, 0x1C), "检查或下载更新失败", &message);
+                if action_card(
+                    ui,
+                    t,
+                    w,
+                    "set-upd-retry",
+                    "重新尝试检查更新",
+                    "如果处于离线或受限网络环境，也可点击上方按钮前往 GitHub Releases 手动下载",
+                    "重试检查",
+                ) {
+                    self.command(Command::CheckUpdates);
+                }
+            }
+        }
+    }
 }
 
 fn paint_settings_shortcuts(ui: &mut egui::Ui, t: &Theme, w: f32) {
@@ -426,6 +613,77 @@ fn section_title(ui: &mut egui::Ui, t: &Theme, title: &str) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
     widgets::text_left(ui, ui.painter(), rect, title, theme::semibold(12.5), t.text, 0.0);
     ui.add_space(4.0);
+}
+
+fn status_banner(ui: &mut egui::Ui, t: &Theme, w: f32, dot: Color32, title: &str, subtitle: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 56.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(6), t.surface_alt);
+    ui.painter().rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+    ui.painter().circle_filled(Pos2::new(rect.left() + 16.0, rect.top() + 18.0), 4.0, dot);
+    widgets::text_left(
+        ui,
+        ui.painter(),
+        Rect::from_min_max(
+            Pos2::new(rect.left() + 28.0, rect.top() + 7.0),
+            Pos2::new(rect.right() - 12.0, rect.top() + 27.0),
+        ),
+        title,
+        theme::semibold(12.5),
+        t.text,
+        0.0,
+    );
+    widgets::text_left(
+        ui,
+        ui.painter(),
+        Rect::from_min_max(
+            Pos2::new(rect.left() + 28.0, rect.top() + 27.0),
+            Pos2::new(rect.right() - 12.0, rect.bottom() - 6.0),
+        ),
+        subtitle,
+        theme::font(11.0),
+        t.text_tertiary,
+        0.0,
+    );
+    ui.add_space(6.0);
+}
+
+fn progress_banner(ui: &mut egui::Ui, t: &Theme, w: f32, title: &str, subtitle: &str, frac: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 66.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(6), t.surface_alt);
+    ui.painter().rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+    widgets::text_left(
+        ui,
+        ui.painter(),
+        Rect::from_min_max(
+            Pos2::new(rect.left() + 12.0, rect.top() + 8.0),
+            Pos2::new(rect.right() - 12.0, rect.top() + 26.0),
+        ),
+        title,
+        theme::semibold(12.5),
+        t.text,
+        0.0,
+    );
+    widgets::text_left(
+        ui,
+        ui.painter(),
+        Rect::from_min_max(
+            Pos2::new(rect.left() + 12.0, rect.top() + 26.0),
+            Pos2::new(rect.right() - 12.0, rect.top() + 44.0),
+        ),
+        subtitle,
+        theme::font(11.0),
+        t.text_tertiary,
+        0.0,
+    );
+    let track = Rect::from_min_size(Pos2::new(rect.left() + 12.0, rect.bottom() - 14.0), Vec2::new(w - 24.0, 5.0));
+    ui.painter().rect_filled(track, CornerRadius::same(3), t.surface_raised);
+    let fill_w = (track.width() * frac.clamp(0.0, 1.0)).max(8.0).min(track.width());
+    ui.painter().rect_filled(
+        Rect::from_min_size(track.min, Vec2::new(fill_w, track.height())),
+        CornerRadius::same(3),
+        t.accent,
+    );
+    ui.add_space(6.0);
 }
 
 fn segmented_row<T: Copy + PartialEq>(

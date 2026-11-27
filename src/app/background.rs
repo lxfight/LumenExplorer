@@ -56,6 +56,10 @@ impl LumenApp {
                     self.open_location_from_external(loc, open_new_tab);
                 }
             }
+            LaunchTarget::Quit => {
+                self.force_quit = true;
+                platform::request_force_quit();
+            }
         }
     }
 
@@ -73,6 +77,103 @@ impl LumenApp {
             self.sync_watch();
         } else {
             self.navigate_to(loc);
+        }
+    }
+
+    pub(crate) fn start_update_check(&mut self, manual: bool, delay: std::time::Duration) {
+        use crate::shell::updater::{self, UpdateState};
+        if matches!(
+            self.update_state,
+            UpdateState::Checking { .. } | UpdateState::Downloading { .. } | UpdateState::Verifying { .. }
+        ) {
+            return;
+        }
+        self.update_state = UpdateState::Checking { manual };
+        self.update_rx = Some(updater::spawn_check(manual, delay));
+    }
+
+    pub(crate) fn start_update_download(&mut self) {
+        use crate::shell::updater::{self, UpdateState};
+        let info = match &self.update_state {
+            UpdateState::Available(info) => info.clone(),
+            _ => return,
+        };
+        let total = info.asset_size;
+        self.update_state = UpdateState::Downloading { info: info.clone(), downloaded: 0, total };
+        self.update_rx = Some(updater::spawn_download(info));
+    }
+
+    pub(crate) fn install_downloaded_update(&mut self) {
+        use crate::shell::updater::{self, UpdateState};
+        let path = match &self.update_state {
+            UpdateState::ReadyToInstall { installer_path, .. } => installer_path.clone(),
+            _ => return,
+        };
+        match updater::launch_installer(&path) {
+            Ok(()) => {
+                self.force_quit = true;
+                platform::request_force_quit();
+            }
+            Err(err) => {
+                self.toast_error(err.to_string());
+            }
+        }
+    }
+
+    fn poll_updater(&mut self) {
+        use crate::shell::updater::{UpdateEvent, UpdateState};
+        let mut events = Vec::new();
+        if let Some(rx) = &self.update_rx {
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
+            match ev {
+                UpdateEvent::UpToDate { checked_at, manual } => {
+                    self.settings.last_update_check = checked_at;
+                    self.update_state = UpdateState::UpToDate { checked_at };
+                    self.update_rx = None;
+                    if manual {
+                        self.toast(format!("当前已是最新版本 v{}", crate::shell::updater::CURRENT_VERSION));
+                    }
+                }
+                UpdateEvent::Available { info, checked_at, manual } => {
+                    self.settings.last_update_check = checked_at;
+                    self.update_rx = None;
+                    if !manual && self.settings.skipped_version.eq_ignore_ascii_case(&info.version) {
+                        self.update_state = UpdateState::UpToDate { checked_at };
+                    } else {
+                        let ver = info.version.clone();
+                        self.update_state = UpdateState::Available(info);
+                        if manual {
+                            self.toast(format!("发现新版本 v{ver}"));
+                        }
+                    }
+                }
+                UpdateEvent::DownloadProgress { info, downloaded, total } => {
+                    self.update_state = UpdateState::Downloading { info, downloaded, total };
+                }
+                UpdateEvent::Verifying { info } => {
+                    self.update_state = UpdateState::Verifying { info };
+                }
+                UpdateEvent::ReadyToInstall { info, installer_path } => {
+                    let ver = info.version.clone();
+                    self.update_state = UpdateState::ReadyToInstall { info, installer_path };
+                    self.update_rx = None;
+                    self.toast(format!("Lumen v{ver} 已下载并完成校验，可立即安装"));
+                }
+                UpdateEvent::Error { message, manual } => {
+                    self.update_rx = None;
+                    if manual {
+                        self.update_state = UpdateState::Error { message: message.clone(), manual: true };
+                        self.toast_error(message);
+                    } else {
+                        // Silent startup checks fail quietly when offline or rate-limited.
+                        self.update_state = UpdateState::Idle;
+                    }
+                }
+            }
         }
     }
 
@@ -138,6 +239,7 @@ impl LumenApp {
         for target in incoming_targets {
             self.handle_launch_target(target, true);
         }
+        self.poll_updater();
         if platform::take_global_hotkey()
             && let Ok(pc) = Location::known(&windows::Win32::UI::Shell::FOLDERID_ComputerFolder)
         {

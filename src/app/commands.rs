@@ -352,6 +352,27 @@ impl LumenApp {
                 self.record_folder_view();
             }
             Command::CycleTheme => self.theme_cycle_requested = true,
+            Command::CheckUpdates => self.start_update_check(true, std::time::Duration::ZERO),
+            Command::DownloadUpdate => self.start_update_download(),
+            Command::InstallUpdate => self.install_downloaded_update(),
+            Command::SkipUpdateVersion => {
+                if let crate::shell::updater::UpdateState::Available(info) = &self.update_state {
+                    let skipped = info.version.clone();
+                    self.settings.skipped_version = skipped.clone();
+                    self.update_state = crate::shell::updater::UpdateState::Idle;
+                    self.toast(format!("已跳过 v{skipped}，后续新版本发布时将继续提醒"));
+                }
+            }
+            Command::OpenReleasesPage => {
+                let url = match &self.update_state {
+                    crate::shell::updater::UpdateState::Available(info)
+                    | crate::shell::updater::UpdateState::Downloading { info, .. }
+                    | crate::shell::updater::UpdateState::Verifying { info }
+                    | crate::shell::updater::UpdateState::ReadyToInstall { info, .. } => info.html_url.as_str(),
+                    _ => crate::shell::updater::RELEASES_PAGE_URL,
+                };
+                crate::shell::updater::open_url(url);
+            }
         }
     }
 

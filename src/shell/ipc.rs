@@ -33,6 +33,8 @@ pub enum LaunchTarget {
     SelectFile(PathBuf),
     /// Open a shell parsing name (`::{GUID}`, `shell:...`, or raw path string).
     OpenShell(String),
+    /// Request the running primary instance to save state and exit cleanly (`--quit`).
+    Quit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,13 +42,14 @@ pub struct CliOptions {
     pub target: LaunchTarget,
     pub new_window: bool,
     pub start_background: bool,
+    pub quit: bool,
 }
 
 /// Parses Windows Explorer–compatible command-line flags:
 /// - `<dir_or_file>`
 /// - `/select,<path>` or `/select, <path>`
 /// - `/e,<path>`, `/root,<path>`, `/n`
-/// - `--new-window`, `--background`
+/// - `--new-window`, `--background`, `--quit`
 pub fn parse_args<I, S>(args: I) -> CliOptions
 where
     I: IntoIterator<Item = S>,
@@ -55,6 +58,7 @@ where
     let raw: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
     let mut new_window = false;
     let mut start_background = false;
+    let mut quit = false;
     let mut select_next = false;
     let mut target = LaunchTarget::Default;
 
@@ -64,6 +68,11 @@ where
             continue;
         }
         let lower = trimmed.to_ascii_lowercase();
+        if lower == "--quit" || lower == "--exit" {
+            quit = true;
+            target = LaunchTarget::Quit;
+            continue;
+        }
         if lower == "--new-window" || lower == "/n" {
             new_window = true;
             continue;
@@ -107,7 +116,7 @@ where
         target = classify_target(trimmed.trim_matches('"'));
     }
 
-    CliOptions { target, new_window, start_background }
+    CliOptions { target, new_window, start_background, quit }
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -203,9 +212,13 @@ fn server_loop(tx: Sender<LaunchTarget>) {
             if unsafe { ReadFile(pipe, Some(&mut buf), Some(&mut read), None) }.is_ok() && read > 0 {
                 buf.truncate(read as usize);
                 if let Ok(target) = serde_json::from_slice::<LaunchTarget>(&buf) {
-                    let _ = tx.send(target);
-                    crate::platform::restore_and_focus();
-                    crate::platform::wake();
+                    if target == LaunchTarget::Quit {
+                        crate::platform::request_force_quit();
+                    } else {
+                        let _ = tx.send(target);
+                        crate::platform::restore_and_focus();
+                        crate::platform::wake();
+                    }
                 }
             }
             let _ = unsafe { DisconnectNamedPipe(pipe) };
@@ -252,5 +265,14 @@ mod tests {
 
         let opts = parse_args(["/e,C:\\Windows"]);
         assert_eq!(opts.target, LaunchTarget::OpenDir(PathBuf::from("C:\\Windows")));
+        assert!(!opts.quit);
+
+        let opts = parse_args(["--quit"]);
+        assert!(opts.quit);
+        assert_eq!(opts.target, LaunchTarget::Quit);
+
+        let opts = parse_args(["--exit"]);
+        assert!(opts.quit);
+        assert_eq!(opts.target, LaunchTarget::Quit);
     }
 }

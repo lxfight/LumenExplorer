@@ -82,6 +82,62 @@ impl LumenApp {
                     0.0,
                 );
             }
+        } else if let Some((upd_text, upd_pct, ready)) = match &self.update_state {
+            crate::shell::updater::UpdateState::Available(info) => {
+                Some((format!("有新版本 v{}", info.version), None, false))
+            }
+            crate::shell::updater::UpdateState::Downloading { info, downloaded, total } => {
+                let pct = if *total > 0 { (*downloaded as f32 / *total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                Some((format!("正在更新 v{} ({:.0}%)", info.version, pct * 100.0), Some(pct), false))
+            }
+            crate::shell::updater::UpdateState::Verifying { info } => {
+                Some((format!("正在校验 v{}…", info.version), Some(1.0), false))
+            }
+            crate::shell::updater::UpdateState::ReadyToInstall { info, .. } => {
+                Some((format!("v{} 已就绪 · 点击安装", info.version), None, true))
+            }
+            _ => None,
+        } {
+            let g = widgets::galley(ui, &upd_text, theme::font(11.0), t.accent, 210.0);
+            let pill_w = (g.size().x + 22.0).min((pill_right - rect.left() - 210.0).max(0.0));
+            if pill_w > 84.0 {
+                let pill = Rect::from_min_size(
+                    Pos2::new(pill_right - pill_w, rect.center().y - 10.0),
+                    Vec2::new(pill_w, 20.0),
+                );
+                let uid = egui::Id::unique("update-status-pill");
+                let uresp = ui.interact(pill, uid, Sense::click());
+                let hover = widgets::hover_t(&ctx, uid, uresp.hovered());
+                painter.rect_filled(pill, CornerRadius::same(4), widgets::fade(t.accent_soft, 0.78 + hover * 0.22));
+                if let Some(pct) = upd_pct {
+                    let fw = (pill.width() * pct).clamp(0.0, pill.width());
+                    painter.rect_filled(
+                        Rect::from_min_size(pill.min, Vec2::new(fw, pill.height())),
+                        CornerRadius::same(4),
+                        widgets::fade(t.accent, 0.22),
+                    );
+                }
+                widgets::text_left(
+                    ui,
+                    &painter,
+                    pill.shrink2(Vec2::new(8.0, 0.0)),
+                    &upd_text,
+                    theme::font(11.0),
+                    t.accent,
+                    0.0,
+                );
+                if uresp.hovered() {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if uresp.clicked() {
+                    if ready {
+                        self.command(Command::InstallUpdate);
+                    } else {
+                        self.settings_tab = crate::ui::settings_ui::SettingsTab::Updates;
+                        self.settings_open = true;
+                    }
+                }
+            }
         } else if let Some(clip_path) = self.clipboard_path.clone()
             && self.current_dir().as_deref() != Some(clip_path.as_path())
         {

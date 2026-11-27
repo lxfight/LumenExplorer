@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicIsize, AtomicU8, AtomicU64, Ordering};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_MAINWINDOW, DWMSBT_NONE, DWMWA_BORDER_COLOR,
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -20,7 +20,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, GetCurrentThreadId};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -38,10 +38,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTMAXBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsIconic, IsWindowVisible, IsZoomed, LoadIconW, MF_SEPARATOR,
     MF_STRING, PostMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOWPLACEMENT, WM_APP,
-    WM_CLIPBOARDUPDATE, WM_COMMAND, WM_DEVICECHANGE, WM_DRAWITEM, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_INITMENUPOPUP, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MEASUREITEM, WM_MENUSELECT,
-    WM_MOUSEMOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE,
-    WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_XBUTTONUP,
+    WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND, WM_DEVICECHANGE, WM_DRAWITEM, WM_ENDSESSION, WM_HOTKEY,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_INITMENUPOPUP, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_MEASUREITEM, WM_MENUSELECT, WM_MOUSEMOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE,
+    WM_XBUTTONUP,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -52,7 +53,13 @@ const TRAY_CMD_OPEN: u32 = 1;
 const TRAY_CMD_NEW_WINDOW: u32 = 2;
 const TRAY_CMD_QUIT: u32 = 3;
 
+/// Named Win32 Mutex shared with the Inno Setup installer (`AppMutex`) so
+/// upgrades and uninstalls reliably detect running instances (including in tray).
+const INSTANCE_MUTEX_NAME: &str = "LumenExplorer.SingleInstance.v1";
+
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
+static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
+static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
 static IME_CONTEXT: AtomicIsize = AtomicIsize::new(0);
 static IME_COMPOSING: AtomicBool = AtomicBool::new(false);
 static IME_END_TICK: AtomicU64 = AtomicU64::new(0);
@@ -88,8 +95,29 @@ pub fn init_process() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let app_id = HSTRING::from("Lumen.Explorer");
         let _ = SetCurrentProcessExplicitAppUserModelID(PCWSTR(app_id.as_ptr()));
+        let mutex_name = HSTRING::from(INSTANCE_MUTEX_NAME);
+        if let Ok(handle) = CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr()))
+            && !handle.is_invalid()
+        {
+            INSTANCE_MUTEX.store(handle.0 as isize, Ordering::Relaxed);
+        }
         OleInitialize(None).expect("OLE init failed");
     }
+}
+
+/// Requests an unconditional clean shutdown (bypasses tray-resident hide-on-close),
+/// safe to invoke even while the window is hidden in the notification area.
+pub fn request_force_quit() {
+    FORCE_QUIT.store(true, Ordering::Relaxed);
+    let hwnd = hwnd();
+    if !hwnd.0.is_null() {
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    }
+    wake();
+}
+
+pub fn force_quit_requested() -> bool {
+    FORCE_QUIT.load(Ordering::Relaxed)
 }
 
 /// Called once the winit window exists: installs the Fluent frame and hooks.
@@ -297,7 +325,7 @@ pub fn set_tray_enabled(enabled: bool) {
         {
             data.hIcon = icon;
         }
-        let tip = "Lumen 文件资源管理器";
+        let tip = "Lumen 文件工作台";
         for (dst, src) in data.szTip.iter_mut().zip(tip.encode_utf16()) {
             *dst = src;
         }
@@ -338,6 +366,10 @@ pub fn set_global_hotkey(enabled: bool) -> bool {
 pub fn cleanup_on_exit() {
     let _ = set_global_hotkey(false);
     set_tray_enabled(false);
+    let raw = INSTANCE_MUTEX.swap(0, Ordering::Relaxed);
+    if raw != 0 {
+        let _ = unsafe { CloseHandle(HANDLE(raw as *mut c_void)) };
+    }
 }
 
 fn show_tray_menu(hwnd: HWND) {
@@ -368,6 +400,9 @@ fn show_tray_menu(hwnd: HWND) {
             TRAY_ACTION.store(cmd as u8, Ordering::Relaxed);
             if cmd == TRAY_CMD_OPEN {
                 restore_and_focus();
+            } else if cmd == TRAY_CMD_QUIT {
+                request_force_quit();
+                return;
             }
             wake();
         }
@@ -640,6 +675,13 @@ unsafe extern "system" fn subclass_proc(
                 wake();
                 return LRESULT(1);
             }
+        }
+        WM_QUERYENDSESSION => return LRESULT(1),
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                request_force_quit();
+            }
+            return LRESULT(0);
         }
         WM_COMMAND | WM_INITMENUPOPUP | WM_MEASUREITEM | WM_DRAWITEM | WM_MENUSELECT => {
             if let Some(result) = crate::shell::menu::handle_menu_message(msg, wparam, lparam) {

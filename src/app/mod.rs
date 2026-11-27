@@ -45,6 +45,8 @@ pub struct LumenApp {
     pub(crate) op_worker: OpWorker,
     drives_rx: Option<crossbeam_channel::Receiver<Vec<Drive>>>,
     ipc_rx: Option<crossbeam_channel::Receiver<crate::shell::ipc::LaunchTarget>>,
+    pub(crate) update_state: crate::shell::updater::UpdateState,
+    update_rx: Option<crossbeam_channel::Receiver<crate::shell::updater::UpdateEvent>>,
     pub(crate) force_quit: bool,
     suggest_rx: Option<crossbeam_channel::Receiver<crate::shell::suggest::Suggestions>>,
     suggest_gen: u64,
@@ -247,6 +249,11 @@ pub(crate) enum Command {
     Redo,
     SortBy(SortKey),
     CycleTheme,
+    CheckUpdates,
+    DownloadUpdate,
+    InstallUpdate,
+    SkipUpdateVersion,
+    OpenReleasesPage,
 }
 
 impl LumenApp {
@@ -265,6 +272,9 @@ impl LumenApp {
         }
         if cli.target != crate::shell::ipc::LaunchTarget::Default {
             app.handle_launch_target(cli.target, false);
+        }
+        if crate::shell::updater::should_auto_check(app.settings.auto_check_updates, app.settings.last_update_check) {
+            app.start_update_check(false, Duration::from_secs(3));
         }
         app
     }
@@ -342,6 +352,8 @@ impl LumenApp {
             op_worker: OpWorker::new(),
             drives_rx: None,
             ipc_rx: None,
+            update_state: crate::shell::updater::UpdateState::Idle,
+            update_rx: None,
             force_quit: false,
             suggest_rx: None,
             suggest_gen: 0,
@@ -804,7 +816,11 @@ impl LumenApp {
         let ctx = ui.ctx().clone();
         crate::ui::spring::begin_frame(self.settings.spring_animations);
         // When tray-resident mode is active, closing the window hides it to the
-        // notification area instead of exiting (unless Quit was chosen from tray).
+        // notification area instead of exiting (unless Quit was chosen from tray,
+        // requested via `--quit` IPC, or triggered by Windows session shutdown).
+        if platform::force_quit_requested() {
+            self.force_quit = true;
+        }
         if self.settings.tray_resident && !self.force_quit && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             platform::hide_to_tray();
@@ -963,11 +979,18 @@ impl LumenApp {
         let first_load = self.active().loading && self.active().entries.is_empty();
         let ql_loading = self.quick_look.as_ref().is_some_and(|ql| ql.loading);
         let dir_sizing = self.folder_size.as_ref().is_some_and(|j| j.latest.as_ref().is_none_or(|r| !r.done));
+        let updating = matches!(
+            self.update_state,
+            crate::shell::updater::UpdateState::Checking { .. }
+                | crate::shell::updater::UpdateState::Downloading { .. }
+                | crate::shell::updater::UpdateState::Verifying { .. }
+        );
         let busy = self.icons.is_busy()
             || self.op_worker.is_busy()
             || self.archive_rx.is_some()
             || ql_loading
             || dir_sizing
+            || updating
             || !self.toasts.is_empty()
             || first_load;
         if crate::ui::spring::is_animating() {
