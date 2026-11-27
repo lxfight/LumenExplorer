@@ -126,11 +126,11 @@ Root: HKA; Subkey: "Software\Classes\Directory\shell\Lumen\command"; ValueType: 
 
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Lumen"; ValueType: string; ValueName: ""; ValueData: "{cm:OpenWithLumen}"; Tasks: contextmenu; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Lumen"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#MyAppExeName}"",0"; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Lumen\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%V"""; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\Lumen\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%V\."""; Tasks: contextmenu
 
 Root: HKA; Subkey: "Software\Classes\Drive\shell\Lumen"; ValueType: string; ValueName: ""; ValueData: "{cm:OpenWithLumen}"; Tasks: contextmenu; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Drive\shell\Lumen"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#MyAppExeName}"",0"; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Drive\shell\Lumen\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\Drive\shell\Lumen\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1\."""; Tasks: contextmenu
 
 ; Optional start-minimized-to-tray auto-start (cleanly removed on uninstall).
 Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Lumen"; ValueData: """{app}\{#MyAppExeName}"" --background"; Tasks: autostart; Flags: uninsdeletevalue
