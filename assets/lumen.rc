@@ -5,13 +5,13 @@
 #define LUMEN_VER_MAJOR 0
 #endif
 #ifndef LUMEN_VER_MINOR
-#define LUMEN_VER_MINOR 2
+#define LUMEN_VER_MINOR 3
 #endif
 #ifndef LUMEN_VER_PATCH
-#define LUMEN_VER_PATCH 1
+#define LUMEN_VER_PATCH 0
 #endif
 #ifndef LUMEN_VER_STR
-#define LUMEN_VER_STR 0.2.1.0
+#define LUMEN_VER_STR 0.3.0.0
 #endif
 
 #define _LUMEN_STR(x) #x
