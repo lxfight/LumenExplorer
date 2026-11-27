@@ -19,21 +19,49 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::{
     FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING,
     FOFX_RECYCLEONDELETE, FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Vtbl,
-    IShellItem, SHCreateItemFromParsingName,
+    IShellItem, SHCreateItemFromIDList, SHCreateItemFromParsingName,
 };
 use windows::core::{GUID, HRESULT, HSTRING, IUnknown, IUnknown_Vtbl, Interface, PCWSTR};
 
-use crate::shell::location::item_path;
+use crate::shell::location::{Pidl, is_in_recycle_bin_path, item_path};
 
 #[derive(Clone, Debug)]
 pub enum OpRequest {
-    Copy { items: Vec<PathBuf>, dest_dir: PathBuf },
-    Move { items: Vec<PathBuf>, dest_dir: PathBuf, clear_clipboard: bool },
-    Delete { items: Vec<PathBuf>, permanent: bool },
-    DeleteDirect { items: Vec<PathBuf> },
-    Rename { from: PathBuf, new_name: String, is_undo: bool },
-    NewFolder { parent: PathBuf, name: String },
-    CreateShortcut { items: Vec<PathBuf>, dest_dir: PathBuf },
+    Copy {
+        items: Vec<PathBuf>,
+        dest_dir: PathBuf,
+    },
+    Move {
+        items: Vec<PathBuf>,
+        dest_dir: PathBuf,
+        clear_clipboard: bool,
+    },
+    Delete {
+        items: Vec<PathBuf>,
+        permanent: bool,
+    },
+    /// Permanently deletes virtual shell items (e.g. Recycle Bin entries) via
+    /// their serialized absolute PIDLs so Windows cleans up `$R`/`$I` pairs
+    /// atomically and prompts with the original filenames for permanent deletion.
+    DeletePidls {
+        pidl_bytes: Vec<Vec<u8>>,
+    },
+    DeleteDirect {
+        items: Vec<PathBuf>,
+    },
+    Rename {
+        from: PathBuf,
+        new_name: String,
+        is_undo: bool,
+    },
+    NewFolder {
+        parent: PathBuf,
+        name: String,
+    },
+    CreateShortcut {
+        items: Vec<PathBuf>,
+        dest_dir: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +177,7 @@ fn req_label(req: &OpRequest) -> String {
                 format!("正在删除 {} 个项目…", items.len())
             }
         }
+        OpRequest::DeletePidls { pidl_bytes } => format!("正在永久删除 {} 个项目…", pidl_bytes.len()),
         OpRequest::DeleteDirect { items } => format!("正在撤销 {} 个项目…", items.len()),
         OpRequest::Rename { new_name, .. } => format!("正在重命名为 {new_name}…"),
         OpRequest::NewFolder { name, .. } => format!("正在新建 {name}…"),
@@ -162,6 +191,7 @@ struct SinkData {
     progress: Arc<Mutex<OpProgress>>,
     landed_pairs: Mutex<Vec<(PathBuf, PathBuf)>>,
     deleted: Mutex<Vec<PathBuf>>,
+    deleted_count: AtomicUsize,
 }
 
 #[repr(C)]
@@ -292,6 +322,7 @@ unsafe extern "system" fn sink_post_delete(
 ) -> HRESULT {
     if hr.is_ok() {
         let obj = unsafe { &*(this as *const SinkObject) };
+        obj.data.deleted_count.fetch_add(1, Ordering::Relaxed);
         if let Some(src) = unsafe { IShellItem::from_raw_borrowed(&item) }.and_then(item_path)
             && let Ok(mut list) = obj.data.deleted.lock()
         {
@@ -377,10 +408,23 @@ static SINK_VTABLE: IFileOperationProgressSink_Vtbl = IFileOperationProgressSink
 };
 
 fn new_sink(progress: Arc<Mutex<OpProgress>>) -> (IFileOperationProgressSink, Arc<SinkData>) {
-    let data = Arc::new(SinkData { progress, landed_pairs: Mutex::new(Vec::new()), deleted: Mutex::new(Vec::new()) });
+    let data = Arc::new(SinkData {
+        progress,
+        landed_pairs: Mutex::new(Vec::new()),
+        deleted: Mutex::new(Vec::new()),
+        deleted_count: AtomicUsize::new(0),
+    });
     let obj = Box::new(SinkObject { vtable: &SINK_VTABLE, refs: AtomicU32::new(1), data: data.clone() });
     let sink = unsafe { IFileOperationProgressSink::from_raw(Box::into_raw(obj).cast::<c_void>()) };
     (sink, data)
+}
+
+fn finish_allow_cancel(res: windows::core::Result<()>) -> anyhow::Result<()> {
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) if crate::shell::ops::is_user_cancelled_hr(e.code().0 as u32) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn create_op(flags: FILEOPERATION_FLAGS, sink: &IFileOperationProgressSink) -> anyhow::Result<(IFileOperation, u32)> {
@@ -435,6 +479,8 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             Ok(OpResult::Moved { pairs, clear_clipboard })
         }
         OpRequest::Delete { items, permanent } => {
+            // Never attempt to recycle items already inside a physical `$Recycle.Bin` folder.
+            let permanent = permanent || (!items.is_empty() && items.iter().all(|p| is_in_recycle_bin_path(p)));
             let flags = if permanent {
                 FOF_WANTNUKEWARNING
             } else {
@@ -447,10 +493,33 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             }
             let res = unsafe { op.PerformOperations() };
             let _ = unsafe { op.Unadvise(cookie) };
-            res?;
+            finish_allow_cancel(res)?;
             let deleted = data.deleted.lock().unwrap().clone();
-            let count = deleted.len();
+            let count = data.deleted_count.load(Ordering::Relaxed);
             Ok(OpResult::Deleted { items: deleted, permanent, count })
+        }
+        OpRequest::DeletePidls { pidl_bytes } => {
+            // Permanent delete via Recycle Bin PIDLs: omitting FOF_ALLOWUNDO and
+            // FOFX_RECYCLEONDELETE makes Windows show the native permanent-delete
+            // confirmation with original filenames and remove `$R`/`$I` pairs cleanly.
+            let (op, cookie) = create_op(FOF_WANTNUKEWARNING, &sink)?;
+            let mut queued_any = false;
+            for bytes in &pidl_bytes {
+                let Some(pidl) = Pidl::from_bytes(bytes) else { continue };
+                let shell: IShellItem = unsafe { SHCreateItemFromIDList(pidl.as_ptr()) }
+                    .map_err(|e| anyhow::anyhow!("SHCreateItemFromIDList failed: {e}"))?;
+                unsafe { op.DeleteItem(&shell, None::<&IFileOperationProgressSink>) }?;
+                queued_any = true;
+            }
+            if !queued_any {
+                let _ = unsafe { op.Unadvise(cookie) };
+                return Ok(OpResult::Deleted { items: Vec::new(), permanent: true, count: 0 });
+            }
+            let res = unsafe { op.PerformOperations() };
+            let _ = unsafe { op.Unadvise(cookie) };
+            finish_allow_cancel(res)?;
+            let count = data.deleted_count.load(Ordering::Relaxed);
+            Ok(OpResult::Deleted { items: Vec::new(), permanent: true, count })
         }
         OpRequest::DeleteDirect { items } => {
             let (op, cookie) = create_op(FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING, &sink)?;
@@ -512,5 +581,20 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             }
             Ok(OpResult::CreatedShortcuts { paths })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn treats_shell_cancel_hresults_as_benign() {
+        let cancel = windows::core::Error::from_hresult(HRESULT(0x8027_0000u32 as i32));
+        assert!(finish_allow_cancel(Err(cancel)).is_ok());
+        let win32_cancel = windows::core::Error::from_hresult(HRESULT(0x8007_04C7u32 as i32));
+        assert!(finish_allow_cancel(Err(win32_cancel)).is_ok());
+        let access_denied = windows::core::Error::from_hresult(HRESULT(0x8007_0005u32 as i32));
+        assert!(finish_allow_cancel(Err(access_denied)).is_err());
     }
 }

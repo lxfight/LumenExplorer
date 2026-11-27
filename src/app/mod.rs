@@ -1419,4 +1419,25 @@ mod tests {
         app.command(Command::ToggleSplitView);
         assert!(app.secondary_tab.is_none());
     }
+
+    #[test]
+    fn recycle_bin_identifies_context_and_blocks_rename() {
+        let _com = Com::init();
+        let ctx = egui::Context::default();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut app = LumenApp::with_context(&ctx, settings_for(root));
+        assert!(!app.active().is_recycle_bin());
+
+        let bin = Location::known(&windows::Win32::UI::Shell::FOLDERID_RecycleBinFolder).expect("recycle bin");
+        assert!(bin.is_recycle_bin());
+        app.tabs[0] = Tab::new(bin, false, false);
+        app.active_mut().entries = std::sync::Arc::new(vec![entry("deleted.txt")]);
+        app.active_mut().rebuild_display();
+        app.active_mut().select_row(0, NONE);
+        assert!(app.active().is_recycle_bin());
+
+        app.command(Command::Rename);
+        assert!(app.rename.is_none(), "rename must be blocked inside Recycle Bin");
+        assert!(app.dialog.is_none(), "batch rename dialog must not open inside Recycle Bin");
+    }
 }

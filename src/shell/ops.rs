@@ -156,9 +156,19 @@ pub fn run_as_admin(item: &Path) -> anyhow::Result<()> {
     shell_execute("runas", item)
 }
 
-pub fn empty_recycle_bin() -> anyhow::Result<()> {
-    unsafe { SHEmptyRecycleBinW(Some(crate::platform::hwnd()), PCWSTR::null(), 0) }
-        .map_err(|e| anyhow!("清空回收站失败: {e}"))
+pub fn empty_recycle_bin() -> anyhow::Result<bool> {
+    match unsafe { SHEmptyRecycleBinW(Some(crate::platform::hwnd()), PCWSTR::null(), 0) } {
+        Ok(()) => Ok(true),
+        Err(e) if is_user_cancelled_hr(e.code().0 as u32) => Ok(false),
+        Err(e) => Err(anyhow!("清空回收站失败: {e}")),
+    }
+}
+
+/// True for standard Windows Shell user-cancellation HRESULTs (`ERROR_CANCELLED`,
+/// `COPYENGINE_E_USER_CANCELLED`, or `E_UNEXPECTED` returned by `SHEmptyRecycleBinW`
+/// when the user dismisses the confirmation dialog).
+pub fn is_user_cancelled_hr(code: u32) -> bool {
+    matches!(code, 0x8027_0000 | 0x8007_04C7 | 0x8000_FFFF)
 }
 
 /// Invokes a shell canonical verb (e.g. `"undelete"`, `"eject"`, `"properties"`,

@@ -57,8 +57,7 @@ pub(crate) struct ContextMenuState {
 impl ContextMenuState {
     pub fn open(app: &LumenApp, anchor: Pos2) -> Self {
         let tab = app.active();
-        let is_recycle = tab.location.path.is_none()
-            && tab.location.parsing_name().eq_ignore_ascii_case("::{645FF040-5081-101B-9F08-00AA002F954E}");
+        let is_recycle = tab.is_recycle_bin();
         let paths = tab.selected_paths();
         let has_sel = !tab.selection.is_empty();
         let kind = if is_recycle {
@@ -314,8 +313,21 @@ impl LumenApp {
                     if hover > 0.0 {
                         painter.rect_filled(row, CornerRadius::same(5), widgets::fade(t.hover_strong, hover));
                     }
-                    let text_col = if enabled { t.text } else { t.text_disabled };
-                    let icon_col = if enabled { t.text_secondary } else { t.text_disabled };
+                    let is_danger = matches!(action, CtxAction::Cmd(Command::PermanentDelete));
+                    let text_col = if !enabled {
+                        t.text_disabled
+                    } else if is_danger {
+                        t.danger
+                    } else {
+                        t.text
+                    };
+                    let icon_col = if !enabled {
+                        t.text_disabled
+                    } else if is_danger {
+                        t.danger
+                    } else {
+                        t.text_secondary
+                    };
                     widgets::icon_at(&painter, Pos2::new(row.left() + 16.0, row.center().y), glyph, 13.5, icon_col);
                     let right_pad = if shortcut.is_some() { 76.0 } else { 10.0 };
                     widgets::text_left(
@@ -683,12 +695,26 @@ fn build_rows(state: &ContextMenuState) -> Vec<CtxRow> {
             });
             rows.push(CtxRow::Item {
                 glyph: icons::DELETE,
+                label: "永久删除".into(),
+                shortcut: Some("Del"),
+                action: CtxAction::Cmd(Command::PermanentDelete),
+                enabled: true,
+            });
+            rows.push(CtxRow::Sep);
+            rows.push(CtxRow::Item {
+                glyph: icons::DELETE,
                 label: "清空回收站".into(),
                 shortcut: None,
                 action: CtxAction::Cmd(Command::EmptyRecycleBin),
                 enabled: true,
             });
-            rows.push(CtxRow::Sep);
+            rows.push(CtxRow::Item {
+                glyph: icons::INFO,
+                label: "属性".into(),
+                shortcut: Some("Alt+Enter"),
+                action: CtxAction::Cmd(Command::Properties),
+                enabled: true,
+            });
             rows.push(CtxRow::Item {
                 glyph: icons::MORE,
                 label: "显示更多选项".into(),

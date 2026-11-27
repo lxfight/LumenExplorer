@@ -27,7 +27,6 @@ const LINUX: &str = "\u{E756}";
 /// `::{GUID}` parsing names of the virtual folders. Display names are localized
 /// by the shell, so they cannot identify a location.
 const NETWORK_PARSING: &str = "::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}";
-const RECYCLE_PARSING: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
 
 /// Detects user's local OneDrive folder(s) via standard Windows environment variables
 /// once per process (zero per-frame disk/env overhead).
@@ -325,7 +324,7 @@ impl LumenApp {
                 new_tab_virtual = Some(location);
             }
 
-            let recycle = virtual_name.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(RECYCLE_PARSING));
+            let recycle = self.active().is_recycle_bin();
             let row = nav_row(ui, &painter, &t, inner_width, "回收站", None, BIN, recycle, false);
             if recycle {
                 selected_rect = Some(row.rect);

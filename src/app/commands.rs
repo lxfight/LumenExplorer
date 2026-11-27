@@ -95,6 +95,10 @@ impl LumenApp {
                 self.delete_selection(command == Command::PermanentDelete);
             }
             Command::Rename => {
+                if self.active().is_recycle_bin() {
+                    self.toast("回收站中的项目不支持重命名");
+                    return;
+                }
                 if self.active().selection.len() > 1 {
                     self.dialog = Some(Dialog::BatchRename {
                         find: String::new(),
@@ -170,19 +174,15 @@ impl LumenApp {
             }
             Command::PasteImage => self.paste_clipboard_image(),
             Command::EmptyRecycleBin => match crate::shell::ops::empty_recycle_bin() {
-                Ok(()) => {
+                Ok(true) => {
                     self.toast("已清空回收站");
                     self.reload_active();
                 }
+                Ok(false) => {}
                 Err(err) => self.toast_error(format!("{err:#}")),
             },
             Command::RestoreSelected => {
-                let pidls: Vec<std::sync::Arc<crate::shell::Pidl>> = self
-                    .active()
-                    .selection
-                    .iter()
-                    .filter_map(|i| self.active().entries.get(*i).and_then(|e| e.pidl.clone()))
-                    .collect();
+                let pidls = self.active().selected_pidls();
                 if pidls.is_empty() {
                     return;
                 }
@@ -214,6 +214,15 @@ impl LumenApp {
                 }
             }
             Command::Properties => {
+                if self.active().is_recycle_bin() {
+                    let pidls = self.active().selected_pidls();
+                    if !pidls.is_empty()
+                        && let Err(err) = crate::shell::ops::invoke_pidl_verb(&pidls, "properties")
+                    {
+                        self.toast_error(format!("{err:#}"));
+                    }
+                    return;
+                }
                 let mut paths = self.active().selected_paths();
                 if paths.is_empty()
                     && let Some(dir) = self.current_dir()
@@ -419,7 +428,24 @@ impl LumenApp {
 
     /// Deletes through the shell, which owns confirmation (the Recycle Bin
     /// setting and the permanent-delete warning), instead of double-prompting.
+    /// Inside the Recycle Bin, always permanently deletes via virtual PIDLs so
+    /// Windows displays the native permanent-delete warning with original names
+    /// and cleans up `$R`/`$I` pairs atomically.
     fn delete_selection(&mut self, permanent: bool) {
+        if self.active().is_recycle_bin() {
+            let pidls = self.active().selected_pidls();
+            if pidls.is_empty() {
+                self.toast_error("没有选中项目");
+                return;
+            }
+            let pidl_bytes: Vec<Vec<u8>> = pidls.iter().map(|p| p.to_bytes()).filter(|b| !b.is_empty()).collect();
+            if pidl_bytes.is_empty() {
+                self.toast_error("无法定位所选回收站项目");
+                return;
+            }
+            self.op_worker.submit(OpRequest::DeletePidls { pidl_bytes });
+            return;
+        }
         let paths = self.active().selected_paths();
         if paths.is_empty() {
             self.toast_error("没有选中项目");
@@ -664,17 +690,19 @@ impl LumenApp {
     /// Lazily initializes and pops the classic Win32 `IContextMenu` containing
     /// all third-party Shell extensions and virtual item verbs.
     pub(crate) fn open_classic_context_menu(&mut self, extended: bool) {
+        if self.active().is_recycle_bin() || self.current_dir().is_none() {
+            let pidls = self.active().selected_pidls();
+            if !pidls.is_empty() {
+                crate::shell::menu::show_classic_for_pidls(&pidls, extended);
+                return;
+            }
+        }
         let paths = self.active().selected_paths();
         if !paths.is_empty() {
             crate::shell::menu::show_classic_for_items(&paths, extended);
             return;
         }
-        let pidls: Vec<std::sync::Arc<crate::shell::Pidl>> = self
-            .active()
-            .selection
-            .iter()
-            .filter_map(|i| self.active().entries.get(*i).and_then(|e| e.pidl.clone()))
-            .collect();
+        let pidls = self.active().selected_pidls();
         if !pidls.is_empty() {
             crate::shell::menu::show_classic_for_pidls(&pidls, extended);
             return;
@@ -686,6 +714,9 @@ impl LumenApp {
 
     pub(crate) fn finish_rename(&mut self) {
         let Some(rename) = self.rename.take() else { return };
+        if self.active().is_recycle_bin() {
+            return;
+        }
         let Some(entry) = self.active().entries.get(rename.row).cloned() else {
             return;
         };

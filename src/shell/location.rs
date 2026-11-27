@@ -14,6 +14,9 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::{GUID, HSTRING, PCWSTR, PWSTR};
 
+/// Canonical desktop parsing name for the Windows Recycle Bin virtual folder.
+pub const RECYCLE_BIN_PARSING: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
+
 /// Owned absolute shell item id list.
 pub struct Pidl {
     raw: *mut ITEMIDLIST,
@@ -167,6 +170,18 @@ impl Location {
                 .unwrap_or_else(|_| self.display.clone())
         }
     }
+
+    /// True when this location is the Windows Recycle Bin virtual folder.
+    pub fn is_recycle_bin(&self) -> bool {
+        self.path.is_none() && self.parsing_name().eq_ignore_ascii_case(RECYCLE_BIN_PARSING)
+    }
+}
+
+/// True when a physical filesystem path lies inside any volume's `$Recycle.Bin`
+/// directory (defense-in-depth when browsing with system files visible).
+pub fn is_in_recycle_bin_path(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, std::path::Component::Normal(seg) if seg.to_string_lossy().eq_ignore_ascii_case("$Recycle.Bin")))
 }
 
 pub fn item_path(item: &IShellItem) -> Option<PathBuf> {
@@ -208,4 +223,17 @@ pub fn known_path(folder: &GUID) -> Option<PathBuf> {
 
 pub fn user_profile() -> PathBuf {
     std::env::var("USERPROFILE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:\\"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_physical_recycle_bin_paths() {
+        assert!(is_in_recycle_bin_path(Path::new(r"C:\$Recycle.Bin\S-1-5-21-123\$RABC123.txt")));
+        assert!(is_in_recycle_bin_path(Path::new(r"D:\$recycle.bin\S-1-5-21-999")));
+        assert!(!is_in_recycle_bin_path(Path::new(r"C:\Users\Test\Recycle.Bin\a.txt")));
+        assert!(!is_in_recycle_bin_path(Path::new(r"D:\Work\notes.md")));
+    }
 }

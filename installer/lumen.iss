@@ -7,7 +7,7 @@
 ;   ISCC.exe /DMyAppVersion=0.2.0 installer\lumen.iss
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.0"
+  #define MyAppVersion "0.2.1"
 #endif
 
 #define MyAppName "Lumen"

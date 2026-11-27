@@ -426,11 +426,23 @@ impl Tab {
         self.update_selected_stats();
     }
 
+    pub fn is_recycle_bin(&self) -> bool {
+        self.location.is_recycle_bin()
+    }
+
     pub fn selected_paths(&self) -> Vec<PathBuf> {
         self.selection
             .iter()
             .filter_map(|index| self.entries.get(*index))
             .filter_map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    pub fn selected_pidls(&self) -> Vec<std::sync::Arc<crate::shell::Pidl>> {
+        self.selection
+            .iter()
+            .filter_map(|index| self.entries.get(*index))
+            .filter_map(|entry| entry.pidl.clone())
             .collect()
     }
 

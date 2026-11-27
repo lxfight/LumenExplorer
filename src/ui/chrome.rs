@@ -48,6 +48,56 @@ fn strip_state_id() -> egui::Id {
 /// Icon button with hover fill, tooltip and the shared disabled treatment.
 // Immediate-mode paint helper: each argument is distinct draw state.
 #[allow(clippy::too_many_arguments)]
+fn cmd_pill_button(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    t: &Theme,
+    rect: Rect,
+    id: egui::Id,
+    glyph: &str,
+    label: &str,
+    tip: &str,
+    enabled: bool,
+    danger: bool,
+) -> bool {
+    let ctx = ui.ctx().clone();
+    let resp = ui.interact(rect, id, Sense::click());
+    let hover = widgets::hover_t(&ctx, id, resp.hovered() && enabled);
+    if hover > 0.0 {
+        painter.rect_filled(rect, CornerRadius::same(5), widgets::fade(t.hover_strong, hover));
+    }
+    let text_color = if !enabled {
+        t.text_disabled
+    } else if danger {
+        t.danger
+    } else {
+        t.text
+    };
+    let icon_color = if !enabled {
+        t.text_disabled
+    } else if danger {
+        t.danger
+    } else {
+        t.text_secondary
+    };
+    widgets::icon_at(painter, Pos2::new(rect.left() + 14.0, rect.center().y), glyph, 14.0, icon_color);
+    widgets::text_left(
+        ui,
+        painter,
+        Rect::from_min_max(Pos2::new(rect.left() + 26.0, rect.top()), rect.right_bottom()),
+        label,
+        theme::font(12.5),
+        text_color,
+        0.0,
+    );
+    if enabled && resp.hovered() {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let resp = if resp.hovered() { resp.on_hover_text(tip) } else { resp };
+    enabled && resp.clicked()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn icon_button(
     ui: &mut egui::Ui,
     t: &Theme,
@@ -543,55 +593,82 @@ impl LumenApp {
 
         let selected = self.active().selection.len();
         let has_sel = selected > 0;
-        let actions: [(&str, &str, bool, Command); 5] = [
-            (icons::DELETE, "删除  Del", has_sel, Command::Delete),
-            (icons::RENAME, "重命名  F2", selected == 1, Command::Rename),
-            (icons::PASTE, "粘贴  Ctrl+V", self.clipboard_files, Command::Paste),
-            (icons::COPY, "复制  Ctrl+C", has_sel, Command::Copy),
-            (icons::CUT, "剪切  Ctrl+X", has_sel, Command::Cut),
-        ];
-        for (glyph, tip, enabled, command) in actions {
-            let r = Rect::from_center_size(Pos2::new(right - 15.0, cy), Vec2::splat(command_h));
-            right -= 34.0;
-            let resp = icon_button(ui, &t, r, egui::Id::unique(("cmd", tip)), glyph, 15.0, tip, false, enabled);
-            if enabled && resp.clicked() {
-                self.command(command);
+        let in_recycle_bin = self.active().is_recycle_bin();
+        if in_recycle_bin {
+            let has_items = !self.active().entries.is_empty();
+            let bin_actions: [(&str, &str, &str, f32, bool, bool, Command); 3] = [
+                (
+                    icons::DELETE,
+                    "清空回收站",
+                    "清空回收站中的所有项目",
+                    96.0,
+                    has_items,
+                    true,
+                    Command::EmptyRecycleBin,
+                ),
+                (icons::DELETE, "永久删除", "永久删除所选项目  Del", 86.0, has_sel, true, Command::PermanentDelete),
+                (icons::HISTORY, "还原", "还原所选项目到原位置", 64.0, has_sel, false, Command::RestoreSelected),
+            ];
+            for (glyph, label, tip, w, enabled, danger, command) in bin_actions {
+                let r = Rect::from_center_size(Pos2::new(right - w * 0.5, cy), Vec2::new(w, command_h));
+                right -= w + 6.0;
+                if cmd_pill_button(
+                    ui,
+                    &painter,
+                    &t,
+                    r,
+                    egui::Id::unique(("bin-cmd", label)),
+                    glyph,
+                    label,
+                    tip,
+                    enabled,
+                    danger,
+                ) {
+                    self.command(command);
+                }
             }
-        }
-        widgets::separator_v(&painter, right - 3.0, cy, 20.0, t.divider);
-        right -= 10.0;
+            widgets::separator_v(&painter, right - 2.0, cy, 20.0, t.divider);
+            right -= 10.0;
+        } else {
+            let actions: [(&str, &str, bool, Command); 5] = [
+                (icons::DELETE, "删除  Del", has_sel, Command::Delete),
+                (icons::RENAME, "重命名  F2", selected == 1, Command::Rename),
+                (icons::PASTE, "粘贴  Ctrl+V", self.clipboard_files, Command::Paste),
+                (icons::COPY, "复制  Ctrl+C", has_sel, Command::Copy),
+                (icons::CUT, "剪切  Ctrl+X", has_sel, Command::Cut),
+            ];
+            for (glyph, tip, enabled, command) in actions {
+                let r = Rect::from_center_size(Pos2::new(right - 15.0, cy), Vec2::splat(command_h));
+                right -= 34.0;
+                let resp = icon_button(ui, &t, r, egui::Id::unique(("cmd", tip)), glyph, 15.0, tip, false, enabled);
+                if enabled && resp.clicked() {
+                    self.command(command);
+                }
+            }
+            widgets::separator_v(&painter, right - 3.0, cy, 20.0, t.divider);
+            right -= 10.0;
 
-        // New button: click creates a folder, the shortcut hint mentions it.
-        let can_new = self.current_dir().is_some();
-        let new_rect = Rect::from_center_size(Pos2::new(right - 33.0, cy), Vec2::new(62.0, command_h));
-        right -= 70.0;
-        let new_id = egui::Id::unique("cmd-new");
-        let new_resp = ui.interact(new_rect, new_id, Sense::click());
-        let new_hover = widgets::hover_t(&ctx, new_id, new_resp.hovered() && can_new);
-        if new_hover > 0.0 {
-            painter.rect_filled(new_rect, CornerRadius::same(5), widgets::fade(t.hover_strong, new_hover));
+            // New button: click creates a folder, the shortcut hint mentions it.
+            let can_new = self.current_dir().is_some();
+            let new_rect = Rect::from_center_size(Pos2::new(right - 33.0, cy), Vec2::new(62.0, command_h));
+            right -= 70.0;
+            if cmd_pill_button(
+                ui,
+                &painter,
+                &t,
+                new_rect,
+                egui::Id::unique("cmd-new"),
+                icons::ADD,
+                "新建",
+                "新建文件夹  Ctrl+Shift+N",
+                can_new,
+                false,
+            ) {
+                self.command(Command::NewFolder);
+            }
+            widgets::separator_v(&painter, right - 4.0, cy, 20.0, t.divider);
+            right -= 10.0;
         }
-        let new_color = if can_new { t.text } else { t.text_disabled };
-        widgets::icon_at(&painter, Pos2::new(new_rect.left() + 15.0, new_rect.center().y), icons::ADD, 14.0, new_color);
-        widgets::text_left(
-            ui,
-            &painter,
-            Rect::from_min_max(Pos2::new(new_rect.left() + 26.0, new_rect.top()), new_rect.right_bottom()),
-            "新建",
-            theme::font(12.5),
-            new_color,
-            0.0,
-        );
-        if can_new && new_resp.hovered() {
-            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let new_resp =
-            if new_resp.hovered() { new_resp.on_hover_text("新建文件夹  Ctrl+Shift+N") } else { new_resp };
-        if can_new && new_resp.clicked() {
-            self.command(Command::NewFolder);
-        }
-        widgets::separator_v(&painter, right - 4.0, cy, 20.0, t.divider);
-        right -= 10.0;
 
         // View / details / more.
         let view_resp =
