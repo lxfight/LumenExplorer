@@ -26,7 +26,7 @@ use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use windows::Win32::Foundation::SIZE;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-    GetDIBits, GetObjectW, HBITMAP, HDC, HGDIOBJ,
+    GetDIBits, GetObjectW, HBITMAP, HDC, HGDIOBJ, RGBQUAD,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize, IBindCtx};
@@ -117,14 +117,14 @@ impl SharedQueue {
         })
     }
 
-    fn push(&self, job: Job) {
+    fn push(&self, job: Job) -> Vec<u64> {
         let mut q = self.inner.lock().unwrap();
-        // Bound pending stack size: drop oldest off-screen items when user scrolls fast.
-        if q.stack.len() >= 512 {
-            q.stack.drain(0..128);
-        }
+        // Bound pending stack size: drop oldest off-screen items when user scrolls fast,
+        // returning evicted job IDs so `IconService` can reclaim `cached`, `by_key`, and `pending`.
+        let evicted = if q.stack.len() >= 512 { q.stack.drain(0..128).map(|j| j.id).collect() } else { Vec::new() };
         q.stack.push(job);
         self.cv.notify_one();
+        evicted
     }
 
     fn set_generation(&self, generation: u64) -> Vec<u64> {
@@ -238,7 +238,13 @@ impl IconService {
             id,
             CachedIcon { key: key.clone(), texture: None, bytes: 0, completed: false, last_used: AtomicU64::new(tick) },
         );
-        self.queue.push(Job { id, generation: self.generation, key });
+        let evicted = self.queue.push(Job { id, generation: self.generation, key });
+        for evicted_id in evicted {
+            if let Some(entry) = self.cached.remove(&evicted_id) {
+                self.by_key.remove(&entry.key);
+                self.pending = self.pending.saturating_sub(1);
+            }
+        }
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
         }
@@ -497,6 +503,19 @@ fn icon_image(hicon: HICON) -> anyhow::Result<ColorImage> {
 
 fn icon_bitmaps_image(info: &ICONINFO) -> anyhow::Result<ColorImage> {
     unsafe {
+        if info.hbmColor.is_invalid() {
+            let (width, mask_height) = bitmap_extent(info.hbmMask)?;
+            ensure!(
+                mask_height >= 2 && mask_height.is_multiple_of(2),
+                "monochrome icon mask height {mask_height} must be a positive even number"
+            );
+            let height = mask_height / 2;
+            let hdc = CreateCompatibleDC(None);
+            ensure!(!hdc.is_invalid(), "CreateCompatibleDC failed for {width}x{height} monochrome icon");
+            let mask = dib_bits(hdc, info.hbmMask, width, mask_height, 1);
+            let _ = DeleteDC(hdc);
+            return color_image_from_monochrome_mask(width as usize, height as usize, &mask?);
+        }
         let (width, height) = bitmap_extent(info.hbmColor)?;
         let hdc = CreateCompatibleDC(None);
         ensure!(!hdc.is_invalid(), "CreateCompatibleDC failed for {width}x{height} icon");
@@ -523,11 +542,17 @@ fn bitmap_extent(bitmap: HBITMAP) -> anyhow::Result<(u32, u32)> {
     Ok((info.bmWidth as u32, info.bmHeight.unsigned_abs()))
 }
 
+#[repr(C)]
+struct BitmapInfo2 {
+    header: BITMAPINFOHEADER,
+    colors: [RGBQUAD; 2],
+}
+
 fn dib_bits(hdc: HDC, bitmap: HBITMAP, width: u32, height: u32, bit_count: u16) -> anyhow::Result<Vec<u8>> {
     let stride = (width as usize * bit_count as usize).div_ceil(32) * 4;
     let mut bits = vec![0u8; stride * height as usize];
-    let mut info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
+    let mut info = BitmapInfo2 {
+        header: BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: width as i32,
             biHeight: -(height as i32),
@@ -537,12 +562,50 @@ fn dib_bits(hdc: HDC, bitmap: HBITMAP, width: u32, height: u32, bit_count: u16) 
             biSizeImage: bits.len() as u32,
             ..Default::default()
         },
-        ..Default::default()
+        colors: [
+            RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 },
+            RGBQUAD { rgbBlue: 255, rgbGreen: 255, rgbRed: 255, rgbReserved: 0 },
+        ],
     };
-    let copied =
-        unsafe { GetDIBits(hdc, bitmap, 0, height, Some(bits.as_mut_ptr() as *mut c_void), &mut info, DIB_RGB_COLORS) };
+    let copied = unsafe {
+        GetDIBits(
+            hdc,
+            bitmap,
+            0,
+            height,
+            Some(bits.as_mut_ptr() as *mut c_void),
+            (&mut info as *mut BitmapInfo2).cast::<BITMAPINFO>(),
+            DIB_RGB_COLORS,
+        )
+    };
     ensure!(copied == height as i32, "GetDIBits copied {copied} of {height} scan lines");
     Ok(bits)
+}
+
+fn color_image_from_monochrome_mask(width: usize, height: usize, mask: &[u8]) -> anyhow::Result<ColorImage> {
+    ensure!(width > 0 && height > 0, "empty monochrome icon {width}x{height}");
+    let stride = width.div_ceil(32) * 4;
+    let needed = stride * height * 2;
+    ensure!(mask.len() >= needed, "monochrome icon mask holds {} bytes, {width}x{height} needs {needed}", mask.len());
+    let mut pixels = Vec::with_capacity(width * height);
+    for y in 0..height {
+        let and_row = y * stride;
+        let xor_row = (y + height) * stride;
+        for x in 0..width {
+            let shift = 7 - (x & 7);
+            let byte_off = x / 8;
+            let and_bit = (mask[and_row + byte_off] >> shift) & 1;
+            let xor_bit = (mask[xor_row + byte_off] >> shift) & 1;
+            let pixel = match (and_bit, xor_bit) {
+                (1, 0) => Color32::TRANSPARENT,
+                (0, 0) => Color32::from_rgba_unmultiplied(0, 0, 0, 255),
+                (0, 1) => Color32::from_rgba_unmultiplied(255, 255, 255, 255),
+                _ => Color32::from_rgba_unmultiplied(128, 128, 128, 255),
+            };
+            pixels.push(pixel);
+        }
+    }
+    Ok(ColorImage::new([width, height], pixels))
 }
 
 fn color_image_from_dib(width: usize, height: usize, bgra: &[u8], mask: Option<&[u8]>) -> anyhow::Result<ColorImage> {
@@ -632,10 +695,80 @@ mod tests {
     #[test]
     fn lifo_queue_prioritizes_latest_viewport_item_and_drops_stale_generations() {
         let q = SharedQueue::new();
-        q.push(Job { id: 1, generation: 0, key: IconKey::file_type("a", 16) });
-        q.push(Job { id: 2, generation: 0, key: IconKey::file_type("b", 16) });
+        assert!(q.push(Job { id: 1, generation: 0, key: IconKey::file_type("a", 16) }).is_empty());
+        assert!(q.push(Job { id: 2, generation: 0, key: IconKey::file_type("b", 16) }).is_empty());
         assert_eq!(q.pop().unwrap().id, 2, "newest visible item pops first");
         let dropped = q.set_generation(1);
         assert_eq!(dropped, vec![1], "stale folder items are dropped immediately");
+    }
+
+    #[test]
+    fn queue_overflow_reclaims_pending_and_cache_entries() {
+        let queue = SharedQueue::new();
+        let (_done_tx, done_rx) = unbounded::<Done>();
+        let mut svc = IconService {
+            queue,
+            done_rx,
+            next_id: 1,
+            generation: 0,
+            clock: AtomicU64::new(1),
+            by_key: HashMap::new(),
+            cached: HashMap::new(),
+            resident_bytes: 0,
+            completed_count: 0,
+            pending: 0,
+            ctx: None,
+        };
+        for i in 0..600u32 {
+            svc.request(IconKey::file_type(format!("ext{i}"), 32));
+        }
+        // Triggered one drain of 128 items when reaching 512, leaving 600 - 128 = 472 live jobs.
+        assert_eq!(svc.pending, 472);
+        assert_eq!(svc.cached.len(), 472);
+        assert_eq!(svc.by_key.len(), 472);
+        // Evicted key 0 is cleanly removed so re-requesting it schedules a fresh job.
+        assert!(!svc.by_key.contains_key(&IconKey::file_type("ext0", 32)));
+        let new_id = svc.request(IconKey::file_type("ext0", 32));
+        assert!(new_id > 600);
+        assert_eq!(svc.pending, 473);
+    }
+
+    #[test]
+    fn monochrome_mask_and_hicon_decode_all_four_and_xor_states() {
+        // 4x1 row: pixel 0 = (AND=1,XOR=0 transparent), pixel 1 = (AND=0,XOR=0 black),
+        // pixel 2 = (AND=0,XOR=1 white), pixel 3 = (AND=1,XOR=1 inverted/gray).
+        let mask = [
+            0b1001_0000u8,
+            0,
+            0,
+            0, // AND row (top half)
+            0b0011_0000u8,
+            0,
+            0,
+            0, // XOR row (bottom half)
+        ];
+        let img = color_image_from_monochrome_mask(4, 1, &mask).unwrap();
+        assert_eq!(img.size, [4, 1]);
+        assert_eq!(img.pixels[0], Color32::TRANSPARENT);
+        assert_eq!(img.pixels[1], Color32::from_rgba_unmultiplied(0, 0, 0, 255));
+        assert_eq!(img.pixels[2], Color32::from_rgba_unmultiplied(255, 255, 255, 255));
+        assert_eq!(img.pixels[3], Color32::from_rgba_unmultiplied(128, 128, 128, 255));
+
+        // End-to-end Win32 monochrome HICON via CreateIcon (hbmColor is NULL).
+        use windows::Win32::UI::WindowsAndMessaging::CreateIcon;
+        // 8x2 monochrome icon (1 byte per row, WORD-aligned -> 2 bytes per row in CreateIcon).
+        let and_bits: [u8; 4] = [0b1001_0000, 0, 0b1111_1111, 0];
+        let xor_bits: [u8; 4] = [0b0011_0000, 0, 0b0000_0000, 0];
+        let hicon = unsafe { CreateIcon(None, 8, 2, 1, 1, and_bits.as_ptr(), xor_bits.as_ptr()) }
+            .expect("CreateIcon monochrome");
+        let decoded = icon_image(hicon).expect("monochrome icon_image");
+        let _ = unsafe { DestroyIcon(hicon) };
+        assert_eq!(decoded.size, [8, 2]);
+        assert_eq!(decoded.pixels[0], Color32::TRANSPARENT);
+        assert_eq!(decoded.pixels[1], Color32::from_rgba_unmultiplied(0, 0, 0, 255));
+        assert_eq!(decoded.pixels[2], Color32::from_rgba_unmultiplied(255, 255, 255, 255));
+        assert_eq!(decoded.pixels[3], Color32::from_rgba_unmultiplied(128, 128, 128, 255));
+        // Second row is all AND=1, XOR=0 -> transparent.
+        assert!(decoded.pixels[8..16].iter().all(|&p| p == Color32::TRANSPARENT));
     }
 }

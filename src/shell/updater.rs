@@ -9,10 +9,12 @@
 //! - Verifies downloaded installers against `SHA256SUMS.txt` (when published in
 //!   the release) before launching the Inno Setup upgrade handoff (`/SILENT /RELAUNCH`).
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,10 +23,10 @@ use serde::Deserialize;
 use windows::Win32::Networking::WinHttp::{
     URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_ADDREQ_FLAG_ADD,
     WINHTTP_ADDREQ_FLAG_REPLACE, WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_OPTION_REDIRECT_POLICY,
-    WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE, WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl,
-    WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WinHttpSetOption, WinHttpSetTimeouts,
+    WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP, WINHTTP_OPTION_URL, WINHTTP_QUERY_CONTENT_LENGTH,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect,
+    WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpQueryOption, WinHttpReadData,
+    WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -203,14 +205,79 @@ fn run_check(tx: &Sender<UpdateEvent>, manual: bool) {
     let _ = tx.send(UpdateEvent::Available { info, checked_at, manual });
 }
 
+static VERIFIED_INSTALLERS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+
+fn verified_installers() -> &'static Mutex<HashMap<PathBuf, String>> {
+    VERIFIED_INSTALLERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_verified_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn record_verified_installer(path: &Path, sha256_hex: String) {
+    let key = normalize_verified_path(path);
+    let mut map = verified_installers().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(key, sha256_hex.to_ascii_lowercase());
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("无法读取安装包文件: {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).context("校验安装包读取失败")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize_hex())
+}
+
+fn verify_recorded_installer(installer_path: &Path) -> Result<()> {
+    if !installer_path.is_file() {
+        bail!("找不到已下载的安装包文件");
+    }
+    let key = normalize_verified_path(installer_path);
+    let expected = {
+        let map = verified_installers().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&key).or_else(|| map.get(installer_path)).cloned()
+    }
+    .ok_or_else(|| anyhow!("安装包缺少已验证的 SHA-256 记录，已拒绝启动"))?;
+    let actual = sha256_file(installer_path)?;
+    if !actual.eq_ignore_ascii_case(&expected) {
+        bail!("安装包启动前 SHA-256 二次校验未通过，文件可能已被篡改");
+    }
+    Ok(())
+}
+
+fn update_download_dir() -> PathBuf {
+    update_download_dir_from(std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).map(PathBuf::from))
+}
+
+fn update_download_dir_from(local_app_data: Option<PathBuf>) -> PathBuf {
+    match local_app_data {
+        Some(base) => base.join("Lumen").join("Update"),
+        None => std::env::temp_dir().join("LumenUpdate"),
+    }
+}
+
 fn run_download(tx: &Sender<UpdateEvent>, info: ReleaseInfo) {
-    if !is_allowed_github_url(&info.download_url) {
+    let Some(sha_url) = info.sha256_url.as_deref().filter(|u| !u.trim().is_empty()) else {
+        let _ = tx.send(UpdateEvent::Error {
+            message: "该版本缺少 SHA-256 校验文件，已取消自动安装".to_string(),
+            manual: true,
+        });
+        return;
+    };
+    if !is_allowed_github_url(&info.download_url) || !is_allowed_github_url(sha_url) {
         let _ = tx.send(UpdateEvent::Error {
             message: "拒绝从非受信任来源下载安装包".to_string(), manual: true
         });
         return;
     }
-    let dir = std::env::temp_dir().join("LumenUpdate");
+    let dir = update_download_dir();
     if let Err(err) = std::fs::create_dir_all(&dir) {
         let _ = tx.send(UpdateEvent::Error { message: format!("创建更新缓存目录失败: {err}"), manual: true });
         return;
@@ -250,36 +317,34 @@ fn run_download(tx: &Sender<UpdateEvent>, info: ReleaseInfo) {
     crate::platform::wake();
     let actual_sha256 = hasher.finalize_hex();
 
-    if let Some(sha_url) = &info.sha256_url {
-        match http_get_bytes(sha_url, None, 256 * 1024) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                if let Some(expected) = parse_sha256_for_file(&text, &safe_name) {
-                    if !expected.eq_ignore_ascii_case(&actual_sha256) {
-                        let _ = std::fs::remove_file(&part_path);
-                        let _ = tx.send(UpdateEvent::Error {
-                            message: "安装包 SHA-256 校验未通过，已中止安装并清理临时文件".to_string(),
-                            manual: true,
-                        });
-                        return;
-                    }
-                } else {
+    match http_get_bytes(sha_url, None, 256 * 1024) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            if let Some(expected) = parse_sha256_for_file(&text, &safe_name) {
+                if !expected.eq_ignore_ascii_case(&actual_sha256) {
                     let _ = std::fs::remove_file(&part_path);
                     let _ = tx.send(UpdateEvent::Error {
-                        message: "校验文件中未找到对应安装包的 SHA-256 摘要".to_string(),
+                        message: "安装包 SHA-256 校验未通过，已中止安装并清理临时文件".to_string(),
                         manual: true,
                     });
                     return;
                 }
-            }
-            Err(err) => {
+            } else {
                 let _ = std::fs::remove_file(&part_path);
                 let _ = tx.send(UpdateEvent::Error {
-                    message: format!("无法获取 SHA-256 校验文件，已中止安装: {err}"),
+                    message: "校验文件中未找到对应安装包的 SHA-256 摘要".to_string(),
                     manual: true,
                 });
                 return;
             }
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(&part_path);
+            let _ = tx.send(UpdateEvent::Error {
+                message: format!("无法获取 SHA-256 校验文件，已中止安装: {err}"),
+                manual: true,
+            });
+            return;
         }
     }
 
@@ -289,17 +354,17 @@ fn run_download(tx: &Sender<UpdateEvent>, info: ReleaseInfo) {
         let _ = tx.send(UpdateEvent::Error { message: format!("提交安装包文件失败: {err}"), manual: true });
         return;
     }
+    record_verified_installer(&final_path, actual_sha256);
 
     let _ = tx.send(UpdateEvent::ReadyToInstall { info, installer_path: final_path });
 }
 
-/// Launches the verified installer. For installed copies, performs a clean
-/// silent-progress Inno Setup upgrade with automatic relaunch (`/RELAUNCH`);
-/// for portable copies, opens the standard interactive install wizard.
+/// Launches the verified installer. Re-verifies the on-disk SHA-256 against the
+/// digest recorded at download completion before spawning. For installed copies,
+/// performs a clean silent-progress Inno Setup upgrade with automatic relaunch
+/// (`/RELAUNCH`); for portable copies, opens the interactive install wizard.
 pub fn launch_installer(installer_path: &Path) -> Result<()> {
-    if !installer_path.is_file() {
-        bail!("找不到已下载的安装包文件");
-    }
+    verify_recorded_installer(installer_path)?;
     let mut cmd = std::process::Command::new(installer_path);
     if crate::shell::integrate::is_installed() {
         cmd.args(["/SP-", "/SILENT", "/NORESTART", "/RELAUNCH"]);
@@ -335,16 +400,40 @@ struct SemVer {
 }
 
 fn parse_semver(raw: &str) -> Option<SemVer> {
-    let trimmed = raw.trim().trim_start_matches(['v', 'V']);
-    let (core, prerelease) = match trimmed.split_once('-') {
-        Some((c, _)) => (c, true),
-        None => (trimmed, false),
+    let trimmed = raw.trim();
+    let trimmed = trimmed.strip_prefix('v').or_else(|| trimmed.strip_prefix('V')).unwrap_or(trimmed);
+    let without_build = match trimmed.split_once('+') {
+        Some((before, build)) => {
+            if build.is_empty() {
+                return None;
+            }
+            before
+        }
+        None => trimmed,
     };
-    let core = core.split('+').next().unwrap_or(core);
+    let (core, prerelease) = match without_build.split_once('-') {
+        Some((c, pre)) => {
+            if pre.is_empty() {
+                return None;
+            }
+            (c, true)
+        }
+        None => (without_build, false),
+    };
     let mut parts = core.split('.');
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let minor = parts.next().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0);
-    let patch = parts.next().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0);
+    let parse_seg = |seg: Option<&str>| -> Option<u64> {
+        let seg = seg?;
+        if seg.is_empty() || !seg.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        seg.parse::<u64>().ok()
+    };
+    let major = parse_seg(parts.next())?;
+    let minor = parse_seg(parts.next())?;
+    let patch = parse_seg(parts.next())?;
+    if parts.next().is_some() {
+        return None;
+    }
     Some(SemVer { major, minor, patch, prerelease })
 }
 
@@ -386,11 +475,29 @@ fn select_checksum_asset<'a>(assets: &'a [GitHubAsset], installer_name: &str) ->
 }
 
 fn is_allowed_github_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
+    if url.contains('@') {
+        return false;
+    }
+    let Ok(parsed) = crack_url(url) else {
         return false;
     };
-    let host = rest.split('/').next().unwrap_or("").to_ascii_lowercase();
-    host == "github.com" || host == "api.github.com" || host.ends_with(".githubusercontent.com")
+    if !parsed.https || parsed.port != 443 {
+        return false;
+    }
+    let host = parsed.host.to_ascii_lowercase();
+    if matches!(
+        host.as_str(),
+        "github.com" | "api.github.com" | "objects.githubusercontent.com" | "release-assets.githubusercontent.com"
+    ) {
+        return true;
+    }
+    if let Some(sub) = host.strip_suffix(".githubusercontent.com") {
+        return !sub.is_empty()
+            && sub
+                .split('.')
+                .all(|label| !label.is_empty() && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    }
+    false
 }
 
 /// Parses `<64-hex-sha256>  <filename>` or `<64-hex-sha256> *<filename>` lines.
@@ -443,13 +550,20 @@ struct ParsedUrl {
 
 fn crack_url(url: &str) -> Result<ParsedUrl> {
     let wide: Vec<u16> = url.encode_utf16().collect();
+    let buf_cap = wide.len().max(2048) + 1;
     let mut host_buf = vec![0u16; 256];
-    let mut path_buf = vec![0u16; 2048];
-    let mut extra_buf = vec![0u16; 2048];
+    let mut user_buf = vec![0u16; 256];
+    let mut pass_buf = vec![0u16; 256];
+    let mut path_buf = vec![0u16; buf_cap];
+    let mut extra_buf = vec![0u16; buf_cap];
     let mut comps = URL_COMPONENTS {
         dwStructSize: std::mem::size_of::<URL_COMPONENTS>() as u32,
         lpszHostName: windows::core::PWSTR(host_buf.as_mut_ptr()),
         dwHostNameLength: host_buf.len() as u32,
+        lpszUserName: windows::core::PWSTR(user_buf.as_mut_ptr()),
+        dwUserNameLength: user_buf.len() as u32,
+        lpszPassword: windows::core::PWSTR(pass_buf.as_mut_ptr()),
+        dwPasswordLength: pass_buf.len() as u32,
         lpszUrlPath: windows::core::PWSTR(path_buf.as_mut_ptr()),
         dwUrlPathLength: path_buf.len() as u32,
         lpszExtraInfo: windows::core::PWSTR(extra_buf.as_mut_ptr()),
@@ -457,6 +571,9 @@ fn crack_url(url: &str) -> Result<ParsedUrl> {
         ..Default::default()
     };
     unsafe { WinHttpCrackUrl(&wide, 0, &mut comps) }.context("解析更新 URL 失败")?;
+    if comps.dwUserNameLength > 0 || comps.dwPasswordLength > 0 {
+        bail!("更新 URL 不允许包含认证信息");
+    }
     let https = comps.nScheme == WINHTTP_INTERNET_SCHEME_HTTPS;
     if !https {
         bail!("仅允许通过 HTTPS 获取更新");
@@ -472,10 +589,27 @@ fn crack_url(url: &str) -> Result<ParsedUrl> {
     Ok(ParsedUrl { host, port: comps.nPort, path_and_query, https })
 }
 
+fn query_final_url(request: *mut c_void) -> Result<String> {
+    let mut bytes: u32 = 0;
+    let _ = unsafe { WinHttpQueryOption(request, WINHTTP_OPTION_URL, None, &mut bytes) };
+    if bytes < 2 {
+        bail!("无法查询重定向后的最终更新 URL");
+    }
+    let mut buf = vec![0u16; (bytes as usize).div_ceil(2)];
+    unsafe { WinHttpQueryOption(request, WINHTTP_OPTION_URL, Some(buf.as_mut_ptr().cast::<c_void>()), &mut bytes) }
+        .context("读取最终请求 URL 失败")?;
+    let chars = (bytes as usize / 2).min(buf.len());
+    let end = buf[..chars].iter().position(|&c| c == 0).unwrap_or(chars);
+    Ok(String::from_utf16_lossy(&buf[..end]))
+}
+
 fn open_get_request(
     url: &str,
     extra_headers: Option<&str>,
 ) -> Result<(WinHttpHandle, WinHttpHandle, WinHttpHandle, u64)> {
+    if !is_allowed_github_url(url) {
+        bail!("拒绝访问非受信任的更新来源 URL");
+    }
     let parsed = crack_url(url)?;
     let agent = HSTRING::from(format!("Lumen/{CURRENT_VERSION} (Windows NT 10.0; Win64; x64)"));
 
@@ -511,10 +645,10 @@ fn open_get_request(
     })
     .ok_or_else(|| anyhow!("创建 HTTP 请求失败"))?;
 
-    // Always follow GitHub release asset HTTPS redirects cleanly.
-    let policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS.to_ne_bytes();
-    let _ =
-        unsafe { WinHttpSetOption(Some(request.0 as *const c_void), WINHTTP_OPTION_REDIRECT_POLICY, Some(&policy)) };
+    // Follow GitHub release asset HTTPS redirects while forbidding HTTPS -> HTTP downgrade.
+    let policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP.to_ne_bytes();
+    unsafe { WinHttpSetOption(Some(request.0 as *const c_void), WINHTTP_OPTION_REDIRECT_POLICY, Some(&policy)) }
+        .context("设置 WinHTTP 重定向策略失败")?;
 
     if let Some(hdrs) = extra_headers {
         let wide: Vec<u16> = hdrs.encode_utf16().collect();
@@ -525,6 +659,11 @@ fn open_get_request(
 
     unsafe { WinHttpSendRequest(request.0, None, None, 0, 0, 0) }.context("发送更新请求失败（请检查网络或代理）")?;
     unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) }.context("接收服务器响应超时或中断")?;
+
+    let final_url = query_final_url(request.0)?;
+    if !is_allowed_github_url(&final_url) {
+        bail!("更新请求被重定向至非受信任域名，已中止");
+    }
 
     let mut status: u32 = 0;
     let mut status_len = std::mem::size_of::<u32>() as u32;
@@ -781,8 +920,92 @@ mod tests {
         assert!(is_allowed_github_url(
             "https://github.com/lxfight/LumenExplorer/releases/download/v0.3.0/LumenSetup-0.3.0-x64.exe"
         ));
+        assert!(is_allowed_github_url("https://api.github.com/repos/lxfight/LumenExplorer/releases/latest"));
         assert!(is_allowed_github_url("https://objects.githubusercontent.com/some/asset"));
+        assert!(is_allowed_github_url("https://release-assets.githubusercontent.com/some/asset"));
+        assert!(is_allowed_github_url("https://github.com:443/lxfight/LumenExplorer"));
         assert!(!is_allowed_github_url("http://github.com/lxfight/LumenExplorer"));
         assert!(!is_allowed_github_url("https://evil.example.com/LumenSetup.exe"));
+        assert!(!is_allowed_github_url("https://github.com@evil.example.com/LumenSetup.exe"));
+        assert!(!is_allowed_github_url("https://user:pass@github.com/LumenSetup.exe"));
+        assert!(!is_allowed_github_url("https://github.com:8443/lxfight/LumenExplorer"));
+        assert!(!is_allowed_github_url("https://evilgithubusercontent.com/asset"));
+        assert!(!is_allowed_github_url("https://.githubusercontent.com/asset"));
+        assert!(!is_allowed_github_url("https://a..b.githubusercontent.com/asset"));
+        assert!(!is_allowed_github_url("https://github.com.evil.com/asset"));
+    }
+
+    #[test]
+    fn parse_semver_rejects_malformed_and_extra_segments() {
+        assert_eq!(parse_semver("1.2.3"), Some(SemVer { major: 1, minor: 2, patch: 3, prerelease: false }));
+        assert_eq!(
+            parse_semver("v1.2.3-rc.1+build.9"),
+            Some(SemVer { major: 1, minor: 2, patch: 3, prerelease: true })
+        );
+        assert_eq!(parse_semver("1.2.3+meta-tag"), Some(SemVer { major: 1, minor: 2, patch: 3, prerelease: false }));
+
+        for bad in
+            ["", "1", "1.2", "1.x.0", "1.2.x", "1.2.3.4", "1.2.", "1..3", "vv1.2.3", "1.+2.3", "1.2.3-", "1.2.3+"]
+        {
+            assert_eq!(parse_semver(bad), None, "expected {bad:?} to be rejected");
+        }
+        assert!(!is_newer_version("0.2.0", "1.x.0"));
+    }
+
+    #[test]
+    fn run_download_refuses_missing_sha256_url() {
+        let (tx, rx) = unbounded();
+        let info = ReleaseInfo {
+            version: "0.9.0".into(),
+            tag_name: "v0.9.0".into(),
+            published_at: String::new(),
+            notes: String::new(),
+            html_url: RELEASES_PAGE_URL.into(),
+            asset_name: "LumenSetup-0.9.0-x64.exe".into(),
+            download_url: "https://github.com/lxfight/LumenExplorer/releases/download/v0.9.0/LumenSetup-0.9.0-x64.exe"
+                .into(),
+            asset_size: 1024,
+            sha256_url: None,
+        };
+        run_download(&tx, info);
+        let ev = rx.try_recv().expect("expected error event");
+        match ev {
+            UpdateEvent::Error { message, manual } => {
+                assert!(manual);
+                assert!(message.contains("SHA-256"), "unexpected message: {message}");
+            }
+            _ => panic!("expected UpdateEvent::Error when sha256_url is None"),
+        }
+    }
+
+    #[test]
+    fn update_download_dir_prefers_localappdata_and_falls_back_to_temp() {
+        let local = update_download_dir_from(Some(PathBuf::from(r"C:\Users\Me\AppData\Local")));
+        assert_eq!(local, PathBuf::from(r"C:\Users\Me\AppData\Local\Lumen\Update"));
+        let fallback = update_download_dir_from(None);
+        assert_eq!(fallback, std::env::temp_dir().join("LumenUpdate"));
+    }
+
+    #[test]
+    fn launch_installer_re_verifies_recorded_sha256_and_detects_tampering() {
+        let dir = std::env::temp_dir().join(format!("lumen-updater-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake_installer = dir.join("fake-installer.bin");
+        std::fs::write(&fake_installer, b"verified-installer-bytes").unwrap();
+
+        // Unrecorded file must be refused by launch_installer before spawning.
+        assert!(launch_installer(&fake_installer).is_err());
+
+        // Record genuine SHA-256 -> pre-launch verification succeeds.
+        let digest = sha256_file(&fake_installer).unwrap();
+        record_verified_installer(&fake_installer, digest);
+        assert!(verify_recorded_installer(&fake_installer).is_ok());
+
+        // Tamper with the file on disk -> pre-launch verification and launch_installer must fail.
+        std::fs::write(&fake_installer, b"tampered-installer-bytes").unwrap();
+        assert!(verify_recorded_installer(&fake_installer).is_err());
+        assert!(launch_installer(&fake_installer).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

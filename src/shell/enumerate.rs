@@ -54,7 +54,7 @@ fn collect_fs(read: std::fs::ReadDir, show_hidden: bool, show_system: bool, canc
             continue;
         }
         let is_folder = meta.is_dir();
-        let ext = Path::new(&name).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let ext = if is_folder { String::new() } else { extract_ext(&name) };
         let kind = if is_folder { "文件夹".to_string() } else { type_name_for_ext(&ext) };
         out.push(Entry {
             name,
@@ -152,8 +152,11 @@ fn shell_entry(loc: &Location, folder: &IShellFolder, child: *mut ITEMIDLIST, sh
             .GetString(&PKEY_ItemTypeText)
             .map(take_pwstr)
             .unwrap_or_else(|_| if is_folder { "文件夹".to_string() } else { "文件".to_string() });
-        let ext =
-            path.as_ref().and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let ext = if is_folder {
+            String::new()
+        } else {
+            path.as_ref().and_then(|p| p.file_name()).map(|n| extract_ext(&n.to_string_lossy())).unwrap_or_default()
+        };
         let file_attrs = if hidden { attrs::HIDDEN } else { 0 };
         Some(Entry {
             name,
@@ -266,9 +269,27 @@ fn registry_string(subkey: &str, value: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..len.min(buf.len())]))
 }
 
+/// Extracts a lowercase file extension without the leading dot, also handling
+/// single-dot dotfiles such as `.gitignore`, `.env`, and `.editorconfig` where
+/// `Path::extension()` returns `None`.
+pub fn extract_ext(name_or_path: &str) -> String {
+    let path = Path::new(name_or_path);
+    if let Some(ext) = path.extension() {
+        return ext.to_string_lossy().to_lowercase();
+    }
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+        && let Some(rest) = file_name.strip_prefix('.')
+        && !rest.is_empty()
+        && !rest.contains('.')
+    {
+        return rest.to_lowercase();
+    }
+    String::new()
+}
+
 pub fn fallback_kind(ext: &str) -> &'static str {
     match ext {
-        "txt" | "log" | "md" | "rtf" => "文本文档",
+        "txt" | "log" | "md" | "rtf" | "gitignore" | "env" | "editorconfig" => "文本文档",
         "pdf" => "PDF 文档",
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" => "图像",
         "mp4" | "mkv" | "avi" | "mov" | "webm" => "视频",
@@ -279,5 +300,51 @@ pub fn fallback_kind(ext: &str) -> &'static str {
         "toml" => "TOML 文档",
         "json" => "JSON 文档",
         _ => "文件",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_ext_handles_regular_and_dotfiles() {
+        assert_eq!(extract_ext("report.TXT"), "txt");
+        assert_eq!(extract_ext("archive.tar.gz"), "gz");
+        assert_eq!(extract_ext(".gitignore"), "gitignore");
+        assert_eq!(extract_ext(".ENV"), "env");
+        assert_eq!(extract_ext(".editorconfig"), "editorconfig");
+        assert_eq!(extract_ext(r"C:\repo\.gitignore"), "gitignore");
+        assert_eq!(extract_ext(".env.local"), "local");
+        assert_eq!(extract_ext("Makefile"), "");
+        assert_eq!(extract_ext("trailing."), "");
+        assert_eq!(extract_ext("."), "");
+        assert_eq!(extract_ext(".."), "");
+        assert_eq!(extract_ext("..."), "");
+        assert_eq!(extract_ext(""), "");
+    }
+
+    #[test]
+    fn list_fs_assigns_dotfile_extensions_only_to_files() {
+        let root = std::env::temp_dir().join(format!("lumen-enum-dot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), b"target/\n").unwrap();
+        std::fs::write(root.join(".env"), b"KEY=VAL\n").unwrap();
+
+        let entries = list_fs(&root, true, true, &AtomicBool::new(false)).unwrap();
+        let git_dir = entries.iter().find(|e| e.name == ".git").unwrap();
+        assert!(git_dir.is_folder);
+        assert_eq!(git_dir.ext, "");
+
+        let gitignore = entries.iter().find(|e| e.name == ".gitignore").unwrap();
+        assert!(!gitignore.is_folder);
+        assert_eq!(gitignore.ext, "gitignore");
+
+        let env_file = entries.iter().find(|e| e.name == ".env").unwrap();
+        assert!(!env_file.is_folder);
+        assert_eq!(env_file.ext, "env");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

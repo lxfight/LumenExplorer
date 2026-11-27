@@ -46,6 +46,9 @@ pub struct SizeFilter {
 pub struct DateFilter {
     pub greater: bool,
     pub unix: u64,
+    pub year: u16,
+    pub month: u16,
+    pub day: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,7 +125,7 @@ impl Query {
             if hit.is_folder {
                 return false;
             }
-            let ext = Path::new(&hit.name).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let ext = crate::shell::enumerate::extract_ext(&hit.name);
             if !self.exts.contains(&ext) {
                 return false;
             }
@@ -234,7 +237,7 @@ fn parse_date(input: &str) -> Option<DateFilter> {
     };
     let (year, month, day) = parse_ymd(rest.trim())?;
     let unix = local_midnight_unix(year, month, day)?;
-    Some(DateFilter { greater, unix })
+    Some(DateFilter { greater, unix, year, month, day })
 }
 
 fn parse_ymd(input: &str) -> Option<(u16, u16, u16)> {
@@ -260,7 +263,7 @@ fn local_midnight_unix(year: u16, month: u16, day: u16) -> Option<u64> {
         SystemTimeToFileTime(&utc, &mut filetime).ok()?;
     }
     let ticks = ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64;
-    Some(ticks / 10_000_000 - 11_644_473_600)
+    Some((ticks / 10_000_000).saturating_sub(11_644_473_600))
 }
 
 fn skip_dir(name: &str, attrs: u32, show_hidden: bool) -> bool {
@@ -273,7 +276,7 @@ fn skip_dir(name: &str, attrs: u32, show_hidden: bool) -> bool {
     if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return true;
     }
-    !show_hidden && (name.starts_with('.') || attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0)
+    !show_hidden && (attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0)
 }
 
 const BACKEND_PARALLEL: u8 = 0;
@@ -557,9 +560,20 @@ fn build_everything_query_string(root: &Path, query: &Query) -> String {
     if !query.exts.is_empty() {
         parts.push(format!("ext:{}", query.exts.join(";")));
     }
+    if let Some(size) = query.size {
+        let op = if size.greater { '>' } else { '<' };
+        parts.push(format!("size:{op}{}", size.bytes));
+    }
+    if let Some(date) = query.date {
+        // `date:>YYYY-MM-DD` matches timestamps after local midnight of that day, so query
+        // Everything with `dm:>=YYYY-MM-DD` and let `Query::matches` enforce the exact boundary.
+        let op = if date.greater { ">=" } else { "<" };
+        parts.push(format!("dm:{op}{:04}-{:02}-{:02}", date.year, date.month, date.day));
+    }
     match query.kind {
         Some(KindFilter::Files) => parts.push("file:".to_string()),
         Some(KindFilter::Folders) => parts.push("folder:".to_string()),
+        None if query.size.is_some() => parts.push("file:".to_string()),
         None => {}
     }
     parts.join(" ")
@@ -841,7 +855,7 @@ fn try_everything_search(
             crate::platform::wake();
         }
     }
-    true
+    emitted > 0
 }
 
 // ---- Optional Windows Search Index backend (SystemIndex via ADODB) ---------
@@ -851,19 +865,46 @@ fn try_everything_search(
 fn build_windows_search_aqs(query: &Query) -> String {
     let mut parts = Vec::new();
     for term in &query.terms {
+        if !term.starts_with("name:") && term.contains('\\') {
+            // Subpath wildcard/segment matching cannot be expressed faithfully in AQS;
+            // return empty so `try_windows_search` falls back to parallel walk.
+            return String::new();
+        }
         let clean = term.strip_prefix("name:").unwrap_or(term);
+        if clean.is_empty() || clean == "*" {
+            continue;
+        }
         if clean.contains(' ') {
             parts.push(format!("\"{clean}\""));
         } else {
             parts.push(clean.to_string());
         }
     }
-    for ext in &query.exts {
-        parts.push(format!("ext:.{ext}"));
+    match query.exts.as_slice() {
+        [] => {}
+        [single] => parts.push(format!("ext:.{single}")),
+        many => {
+            let joined = many.iter().map(|ext| format!("ext:.{ext}")).collect::<Vec<_>>().join(" OR ");
+            parts.push(format!("({joined})"));
+        }
+    }
+    if let Some(size) = query.size {
+        let op = if size.greater { '>' } else { '<' };
+        parts.push(format!("System.Size:{op}{}", size.bytes));
+    }
+    if let Some(date) = query.date {
+        let op = if date.greater { ">=" } else { "<" };
+        parts.push(format!("System.DateModified:{op}{:04}-{:02}-{:02}", date.year, date.month, date.day));
     }
     match query.kind {
         Some(KindFilter::Folders) => parts.push("kind:folder".to_string()),
-        Some(KindFilter::Files) | None => {}
+        Some(KindFilter::Files) => {
+            if parts.is_empty() {
+                return String::new();
+            }
+            parts.push("NOT kind:folder".to_string());
+        }
+        None => {}
     }
     parts.join(" ")
 }
@@ -917,7 +958,6 @@ fn try_windows_search(
 
         let mut seen = HashSet::new();
         let mut emitted = 0usize;
-        let mut any_row = false;
         let mut batch: [Option<IShellItem>; 64] = std::array::from_fn(|_| None);
         loop {
             if cancel.load(Ordering::Relaxed) || emitted >= MAX_HITS {
@@ -940,7 +980,6 @@ fn try_windows_search(
                 if path_str.is_empty() {
                     continue;
                 }
-                any_row = true;
                 let path = PathBuf::from(&path_str);
                 let Ok(meta) = std::fs::metadata(&path) else { continue };
                 let attrs = meta.file_attributes();
@@ -971,7 +1010,9 @@ fn try_windows_search(
                 break;
             }
         }
-        Ok(any_row)
+        // Only suppress fallback to parallel walk when Windows Search actually delivered
+        // at least one hit that survived `query.matches(&hit)` filtering.
+        Ok(emitted > 0)
     })();
 
     if need_uninit {
@@ -1106,6 +1147,7 @@ mod tests {
         std::fs::write(root.join("sub/gamma.rs"), b"ccc").unwrap();
         std::fs::write(root.join(".hidden/delta.rs"), b"d").unwrap();
         std::fs::write(root.join("$Recycle.Bin/junk.rs"), b"junk").unwrap();
+        hide(&root.join(".hidden"));
 
         let mut engine = SearchEngine::new();
         engine.start(&root, "*.rs", false);
@@ -1186,12 +1228,82 @@ mod tests {
 
         let mut engine = SearchEngine::new();
         engine.start(&root, "*.rs", false);
-        assert_eq!(sorted_names(&drain(&mut engine)), vec!["visible.rs"]);
+        // Dot-prefixed directories without FILE_ATTRIBUTE_HIDDEN are visible on Windows,
+        // matching `enumerate.rs` and Windows Explorer.
+        assert_eq!(sorted_names(&drain(&mut engine)), vec!["dot.rs", "visible.rs"]);
 
         engine.start(&root, "*.rs", true);
         assert_eq!(sorted_names(&drain(&mut engine)), vec!["attr.rs", "dot.rs", "visible.rs"]);
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pre_1970_date_filter_saturates_without_underflow() {
+        let q = parse_query("date:<1960-01-01");
+        let date = q.date.expect("pre-1970 date should parse safely");
+        assert!(!date.greater);
+        assert_eq!(date.unix, 0);
+        assert_eq!((date.year, date.month, date.day), (1960, 1, 1));
+        assert_eq!(local_midnight_unix(1969, 12, 31), Some(0));
+    }
+
+    #[test]
+    fn everything_query_includes_size_and_date_filters() {
+        let q = parse_query("report ext:rs,md size:>2MB date:<2024-06-01");
+        let built = build_everything_query_string(Path::new(r"C:\Work"), &q);
+        assert!(built.contains("size:>2097152"), "got: {built}");
+        assert!(built.contains("dm:<2024-06-01"), "got: {built}");
+        assert!(built.contains("file:"), "got: {built}");
+
+        let q2 = parse_query("size:<500 date:>2025-01-15");
+        let built2 = build_everything_query_string(Path::new(r"D:\Logs"), &q2);
+        assert!(built2.contains("size:<500"), "got: {built2}");
+        assert!(built2.contains("dm:>=2025-01-15"), "got: {built2}");
+    }
+
+    #[test]
+    fn windows_search_aqs_covers_size_date_and_unrepresentable_fallback() {
+        let q = parse_query("size:>1MB date:<2024-06-01");
+        let aqs = build_windows_search_aqs(&q);
+        assert!(aqs.contains("System.Size:>1048576"), "got: {aqs}");
+        assert!(aqs.contains("System.DateModified:<2024-06-01"), "got: {aqs}");
+
+        let q_gt = parse_query("date:>2024-06-01");
+        let aqs_gt = build_windows_search_aqs(&q_gt);
+        assert!(aqs_gt.contains("System.DateModified:>=2024-06-01"), "got: {aqs_gt}");
+
+        // Unrepresentable queries return empty so `try_windows_search` falls back to parallel walk.
+        assert!(build_windows_search_aqs(&parse_query("type:file")).is_empty());
+        assert!(build_windows_search_aqs(&parse_query("*")).is_empty());
+        assert!(build_windows_search_aqs(&parse_query(r"*\sub\*.rs")).is_empty());
+        assert!(build_windows_search_aqs(&parse_query(r"src\report.rs report")).is_empty());
+
+        // Verify Windows SystemIndex IQueryParser accepts our emitted AQS syntax.
+        use windows::Win32::System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        };
+        use windows::Win32::System::Search::{ICondition, IQueryParser, IQueryParserManager, QueryParserManager};
+        use windows::core::{HSTRING, PCWSTR, w};
+
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let need_uninit = hr.is_ok();
+        let qpm: windows::core::Result<IQueryParserManager> =
+            unsafe { CoCreateInstance(&QueryParserManager, None, CLSCTX_INPROC_SERVER) };
+        if let Ok(qpm) = qpm
+            && let Ok(parser) = unsafe { qpm.CreateLoadedParser::<_, IQueryParser>(w!("SystemIndex"), 0x0409) }
+        {
+            for sample in [aqs.as_str(), aqs_gt.as_str(), "report (ext:.pdf OR ext:.md) kind:folder"] {
+                let w = HSTRING::from(sample);
+                let sol = unsafe { parser.Parse(PCWSTR(w.as_ptr()), None) }.expect("IQueryParser::Parse");
+                let mut cond: Option<ICondition> = None;
+                unsafe { sol.GetQuery(Some(&mut cond), None) }.expect("GetQuery");
+                assert!(cond.is_some(), "expected valid ICondition for AQS {sample:?}");
+            }
+        }
+        if need_uninit {
+            unsafe { CoUninitialize() };
+        }
     }
 
     #[test]
