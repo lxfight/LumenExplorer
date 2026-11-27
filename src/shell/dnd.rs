@@ -91,7 +91,6 @@ pub fn update_drop_context(zones: &[(Rect, PathBuf)], current_dir: Option<PathBu
 
 /// Updates the Quick Access header rect where dragged folders can be pinned,
 /// independent of the current directory or `is_self_or_ancestor` checks.
-#[allow(dead_code)] // Wired in Wave 2 app layer
 pub fn set_pin_drop_rect(rect: Option<Rect>) {
     if let Ok(mut ctx) = DROP_CTX.lock() {
         ctx.pin_drop_rect = rect;

@@ -137,13 +137,8 @@ impl LumenApp {
         let painter = ui.painter().clone();
         let t = self.theme.clone();
 
-        if self.settings.mica_backdrop {
-            painter.rect_filled(rect, CornerRadius::ZERO, t.mica_status_bg);
-            painter.line_segment(
-                [Pos2::new(rect.left(), rect.top()), Pos2::new(rect.right(), rect.top())],
-                Stroke::new(1.0, t.mica_subtle_border),
-            );
-        }
+        // Frosted Mica backing and top divider are already painted by `LumenApp::frame`
+        // (`src/app/mod.rs`) so we avoid double-blending translucent alpha here.
 
         // Compute right-hand view switcher and details toggle first so we know exact middle bounds.
         let models: [(ViewMode, &str, &str); 4] = [

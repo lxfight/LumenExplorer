@@ -137,15 +137,10 @@ pub struct Theme {
 
     /// Frosted backing tokens for Windows 11 DWM Mica mode so chrome, sidebar,
     /// status bar and subtle dividers stay legible over high-contrast wallpapers.
-    #[allow(dead_code)] // Used by UI/App waves
     pub mica_tint: Color32,
-    #[allow(dead_code)] // Used by UI/App waves
     pub mica_chrome_bg: Color32,
-    #[allow(dead_code)] // Used by UI/App waves
     pub mica_sidebar_bg: Color32,
-    #[allow(dead_code)] // Used by UI/App waves
     pub mica_status_bg: Color32,
-    #[allow(dead_code)] // Used by UI/App waves
     pub mica_subtle_border: Color32,
 
     pub text: Color32,

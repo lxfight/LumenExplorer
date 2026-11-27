@@ -60,9 +60,7 @@ pub struct LumenApp {
     pub(crate) crumb_menu: Option<CrumbDropdown>,
     pub(crate) last_selected_click: Option<(usize, f64)>,
     pub(crate) address: AddressState,
-    #[allow(dead_code)] // Consumed by Wave 3 overlays.rs & chrome.rs (BUG-13)
     pub(crate) address_suggest_rect: Option<egui::Rect>,
-    #[allow(dead_code)] // Consumed by Wave 3 chrome.rs (BUG-13)
     pub(crate) address_cursor_end: bool,
     pub(crate) search: SearchUi,
     pub(crate) tab_search: HashMap<u64, TabSearchSnapshot>,
@@ -569,17 +567,14 @@ impl LumenApp {
         self.has_modal_overlay() || self.ctx_menu.is_some() || self.menu_anchor.is_some() || self.crumb_menu.is_some()
     }
 
-    #[allow(dead_code)] // Consumed by Wave 3 UI menus (UI-09)
     pub(crate) fn can_undo(&self) -> bool {
         !self.undo_stack.is_empty()
     }
 
-    #[allow(dead_code)] // Consumed by Wave 3 UI menus (UI-09)
     pub(crate) fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
     }
 
-    #[allow(dead_code)] // Consumed by Wave 3 split-pane focus transitions (BUG-08)
     pub(crate) fn set_focus_secondary(&mut self, secondary: bool) {
         let secondary = secondary && self.secondary_tab.is_some();
         if self.focus_secondary == secondary {

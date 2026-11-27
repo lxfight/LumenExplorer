@@ -62,7 +62,6 @@ pub struct Stats {
 
 pub struct Tab {
     /// Unique, monotonically increasing identifier assigned on construction.
-    #[allow(dead_code)] // Used by UI/App waves
     pub uid: u64,
     pub location: Location,
     pub crumbs: Vec<Crumb>,
@@ -100,7 +99,6 @@ pub struct Tab {
     load: Option<listing::Job>,
     pub generation: u64,
     /// Increments only on real location or search transitions (not in-place refreshes).
-    #[allow(dead_code)] // Used by UI/App waves
     pub nav_generation: u64,
 }
 
@@ -382,7 +380,6 @@ impl Tab {
 
     /// Moves by `delta` steps from `current` within [`Self::visible_entry_indices`],
     /// clamping to the first/last visible entry. Returns `None` if no entries are visible.
-    #[allow(dead_code)] // Used by UI/App waves
     pub fn step_visible_entry(&self, current: Option<usize>, delta: isize) -> Option<usize> {
         let visible = self.visible_entry_indices();
         if visible.is_empty() {

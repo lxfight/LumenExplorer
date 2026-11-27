@@ -139,7 +139,6 @@ pub fn is_primary_instance_running() -> bool {
 
 /// Registers a synchronous hook invoked on `WM_ENDSESSION` so the app can flush
 /// settings and clean up resources before Windows terminates the process.
-#[allow(dead_code)] // Wired in Wave 2 app layer
 pub fn register_shutdown_hook(hook: impl Fn() + Send + Sync + 'static) {
     if let Ok(mut slot) = SHUTDOWN_HOOK.lock() {
         *slot = Some(Arc::new(hook));
@@ -193,7 +192,6 @@ pub fn is_max_button_hovered() -> bool {
 /// Suppresses native `HTCAPTION` / `HTMAXBUTTON` hit-testing while a modal or
 /// popup overlay is open so clicks/hovers cannot drag or trigger Snap Layouts
 /// through the overlay.
-#[allow(dead_code)] // Wired in Wave 2 app layer
 pub fn set_modal_active(active: bool) {
     MODAL_ACTIVE.store(active, Ordering::Relaxed);
     if active {
