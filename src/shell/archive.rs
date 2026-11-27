@@ -47,6 +47,16 @@ pub fn spawn_extract(archive: PathBuf, dest_dir: PathBuf, into_subfolder: bool) 
     rx
 }
 
+fn system_tar_exe() -> PathBuf {
+    if let Some(sys_root) = std::env::var_os("SystemRoot") {
+        let candidate = PathBuf::from(sys_root).join("System32").join("tar.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("tar.exe")
+}
+
 fn compress_zip_sync(items: &[PathBuf], dest_dir: &Path) -> ArchiveOutcome {
     if items.is_empty() {
         return ArchiveOutcome {
@@ -85,20 +95,21 @@ fn compress_zip_sync(items: &[PathBuf], dest_dir: &Path) -> ArchiveOutcome {
         };
     }
 
-    let mut cmd = std::process::Command::new("tar.exe");
+    let mut cmd = std::process::Command::new(system_tar_exe());
     cmd.args(["-a", "-c", "-f"]).arg(&zip_path);
-    let multi_dir = groups.len() > 1;
-    for (idx, (parent, names)) in groups.iter().enumerate() {
+    let single_dir = groups.len() == 1;
+    for (parent, names) in &groups {
         cmd.arg("-C").arg(parent);
-        if idx == 0 {
-            // End option parsing before filenames so names beginning with `-` cannot inject flags.
+        // For a single directory, pass `--` before member names to terminate option parsing.
+        // For multiple directories, bsdtar requires `-C <parent>` between positional groups
+        // (and rejects `--` after positional args), so we neutralize leading `-`/`@` via `./`.
+        if single_dir {
             cmd.arg("--");
         }
         for name in names {
             let text = name.to_string_lossy();
-            // bsdtar treats leading `@` as archive-inclusion even after `--`, and still recognizes
-            // `-C` between positional args; prefixing `./` neutralizes both cleanly.
-            if text.starts_with('@') || (multi_dir && text.starts_with('-')) || text == "-C" {
+            // Neutralize leading `-` (flag injection) and `@` (bsdtar archive-inclusion).
+            if text.starts_with('-') || text.starts_with('@') {
                 let mut safe = std::ffi::OsString::from("./");
                 safe.push(name);
                 cmd.arg(safe);
@@ -156,7 +167,7 @@ fn extract_sync(archive: &Path, dest_dir: &Path, into_subfolder: bool) -> Archiv
         (dest_dir.to_path_buf(), None, !existed)
     };
 
-    let output = std::process::Command::new("tar.exe")
+    let output = std::process::Command::new(system_tar_exe())
         .args(["-x", "-f"])
         .arg(archive)
         .arg("-C")

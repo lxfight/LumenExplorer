@@ -11,11 +11,12 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
-    ReadFile, WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_NONE, FlushFileBuffers, OPEN_EXISTING,
+    PIPE_ACCESS_INBOUND, ReadFile, WriteFile,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -160,8 +161,8 @@ fn try_send_to_pipe(pipe_name: &str, target: &LaunchTarget, extended_retry: bool
         return false;
     };
     let pipe_wide = HSTRING::from(pipe_name);
-    let not_found_delays: &[u64] = if extended_retry { &[15, 30, 50, 80, 120] } else { &[10, 20] };
-    let busy_delays: &[u64] = &[10, 20, 40, 80, 120];
+    let not_found_delays: &[u64] = if extended_retry { &[15, 30, 50, 80, 120, 200, 300] } else { &[10, 20] };
+    let busy_delays: &[u64] = &[10, 20, 40, 80, 120, 200, 300];
     let mut not_found_retries = 0usize;
     let mut busy_retries = 0usize;
 
@@ -205,6 +206,9 @@ fn try_send_to_pipe(pipe_name: &str, target: &LaunchTarget, extended_retry: bool
     let mut written = 0u32;
     let ok = unsafe { WriteFile(handle, Some(&payload), Some(&mut written), None) }.is_ok()
         && written as usize == payload.len();
+    if ok {
+        let _ = unsafe { FlushFileBuffers(handle) };
+    }
     let _ = unsafe { CloseHandle(handle) };
     ok
 }
@@ -235,51 +239,80 @@ fn server_loop(tx: Sender<LaunchTarget>) {
     serve_pipe_loop(PIPE_NAME, tx, false, crate::platform::request_force_quit);
 }
 
+fn read_pipe_payload(pipe: HANDLE) -> Vec<u8> {
+    let mut payload = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while payload.len() < 65_536 {
+        let mut read = 0u32;
+        match unsafe { ReadFile(pipe, Some(&mut chunk), Some(&mut read), None) } {
+            Ok(()) if read > 0 => payload.extend_from_slice(&chunk[..read as usize]),
+            _ => break,
+        }
+    }
+    payload
+}
+
 fn serve_pipe_loop(pipe_name: &str, tx: Sender<LaunchTarget>, stop_on_quit: bool, on_quit: impl Fn()) {
     let pipe_wide = HSTRING::from(pipe_name);
     let mut pipe = create_pipe_instance(&pipe_wide);
+    let mut spare = if pipe != INVALID_HANDLE_VALUE { create_pipe_instance(&pipe_wide) } else { INVALID_HANDLE_VALUE };
     loop {
         if pipe == INVALID_HANDLE_VALUE {
             // Another primary instance already owns the pipe or OS error.
             std::thread::sleep(Duration::from_secs(2));
             pipe = create_pipe_instance(&pipe_wide);
+            if pipe != INVALID_HANDLE_VALUE && spare == INVALID_HANDLE_VALUE {
+                spare = create_pipe_instance(&pipe_wide);
+            }
             continue;
         }
         let connected = match unsafe { ConnectNamedPipe(pipe, None) } {
             Ok(()) => true,
-            Err(err) => err.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0),
+            Err(err) => {
+                let code = err.code();
+                // Both ERROR_PIPE_CONNECTED (client connected before ConnectNamedPipe)
+                // and ERROR_NO_DATA (client connected, wrote buffered bytes, and closed
+                // before ConnectNamedPipe) mean buffered bytes may be waiting for ReadFile.
+                code == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0)
+                    || code == windows::core::HRESULT::from_win32(ERROR_NO_DATA.0)
+            }
         };
-        // Pre-create the next listening instance before reading/disconnecting/closing
-        // the current one so there is never a gap with zero listening pipe instances.
-        let next_pipe = create_pipe_instance(&pipe_wide);
+        // Replenish the spare instance before reading/disconnecting/closing `pipe`
+        // so there is always an active listening pipe instance.
+        if spare == INVALID_HANDLE_VALUE {
+            spare = create_pipe_instance(&pipe_wide);
+        }
+        let next_spare = create_pipe_instance(&pipe_wide);
         let mut should_stop = false;
         if connected {
-            let mut buf = vec![0u8; 4096];
-            let mut read = 0u32;
-            if unsafe { ReadFile(pipe, Some(&mut buf), Some(&mut read), None) }.is_ok() && read > 0 {
-                buf.truncate(read as usize);
-                if let Ok(target) = serde_json::from_slice::<LaunchTarget>(&buf) {
-                    if target == LaunchTarget::Quit {
-                        on_quit();
-                        if stop_on_quit {
-                            should_stop = true;
-                        }
-                    } else {
-                        let _ = tx.send(target);
-                        crate::platform::wake();
+            let buf = read_pipe_payload(pipe);
+            if !buf.is_empty()
+                && let Ok(target) = serde_json::from_slice::<LaunchTarget>(&buf)
+            {
+                if target == LaunchTarget::Quit {
+                    on_quit();
+                    if stop_on_quit {
+                        should_stop = true;
                     }
+                } else {
+                    let _ = tx.send(target);
+                    crate::platform::wake();
                 }
             }
             let _ = unsafe { DisconnectNamedPipe(pipe) };
         }
         let _ = unsafe { CloseHandle(pipe) };
         if should_stop {
-            if next_pipe != INVALID_HANDLE_VALUE {
-                let _ = unsafe { CloseHandle(next_pipe) };
+            if spare != INVALID_HANDLE_VALUE {
+                let _ = unsafe { CloseHandle(spare) };
+            }
+            if next_spare != INVALID_HANDLE_VALUE {
+                let _ = unsafe { CloseHandle(next_spare) };
             }
             break;
         }
-        pipe = next_pipe;
+        pipe = spare;
+        spare = next_spare;
     }
 }
 
@@ -359,7 +392,11 @@ mod tests {
         // Rapid consecutive invocations must all succeed without missing a pipe instance.
         for i in 0..15 {
             let target = LaunchTarget::OpenShell(format!("shell:Test{i}"));
-            assert!(try_send_to_pipe(&pipe, &target, true), "send {i} failed");
+            let sent = try_send_to_pipe(&pipe, &target, true);
+            if !sent {
+                let _ = try_send_to_pipe(&pipe, &LaunchTarget::Quit, true);
+                panic!("send {i} failed");
+            }
         }
         assert!(try_send_to_pipe(&pipe, &LaunchTarget::Quit, true));
         handle.join().expect("server thread cleanly exits on Quit");
@@ -382,9 +419,54 @@ mod tests {
         });
 
         let target = LaunchTarget::OpenDir(PathBuf::from(r"C:\"));
-        assert!(try_send_to_pipe(&pipe, &target, true));
-        assert!(try_send_to_pipe(&pipe, &LaunchTarget::Quit, true));
+        let sent = try_send_to_pipe(&pipe, &target, true);
+        let quit_sent = try_send_to_pipe(&pipe, &LaunchTarget::Quit, true);
+        assert!(sent, "client retry send failed");
+        assert!(quit_sent, "client Quit send failed");
         handle.join().expect("server thread exits cleanly");
         assert_eq!(rx.try_recv().ok(), Some(target));
+    }
+
+    #[test]
+    fn pipe_reads_buffered_payload_when_client_closes_before_connect() {
+        // Explicitly reproduce the fast-client ERROR_NO_DATA race: a client connects to a
+        // freshly created pipe, writes its payload, and closes BEFORE ConnectNamedPipe runs.
+        let pipe_name = format!(r"\\.\pipe\LumenExplorer.IPC.Test.FastClose.{}", std::process::id());
+        let pipe_wide = HSTRING::from(pipe_name.as_str());
+        let server_pipe = create_pipe_instance(&pipe_wide);
+        assert_ne!(server_pipe, INVALID_HANDLE_VALUE);
+
+        let target = LaunchTarget::OpenShell("shell:FastClose".into());
+        let payload = serde_json::to_vec(&target).unwrap();
+        let client = unsafe {
+            CreateFileW(
+                PCWSTR(pipe_wide.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .expect("client connect");
+        let mut written = 0u32;
+        unsafe { WriteFile(client, Some(&payload), Some(&mut written), None) }.expect("client write");
+        assert_eq!(written as usize, payload.len());
+        let _ = unsafe { CloseHandle(client) };
+
+        let connected = match unsafe { ConnectNamedPipe(server_pipe, None) } {
+            Ok(()) => true,
+            Err(err) => {
+                let code = err.code();
+                code == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0)
+                    || code == windows::core::HRESULT::from_win32(ERROR_NO_DATA.0)
+            }
+        };
+        assert!(connected, "ConnectNamedPipe must treat ERROR_PIPE_CONNECTED and ERROR_NO_DATA as connected");
+        let received = read_pipe_payload(server_pipe);
+        let _ = unsafe { DisconnectNamedPipe(server_pipe) };
+        let _ = unsafe { CloseHandle(server_pipe) };
+        assert_eq!(serde_json::from_slice::<LaunchTarget>(&received).ok(), Some(target));
     }
 }

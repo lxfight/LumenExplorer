@@ -12,6 +12,7 @@ use windows::Win32::Foundation::{HWND, PROPERTYKEY};
 use windows::Win32::Storage::EnhancedStorage::{PKEY_DateModified, PKEY_FileName};
 #[cfg(test)]
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+use windows::Win32::Storage::FileSystem::GetLongPathNameW;
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, IBindCtx, IDataObject, IPersistFile};
 use windows::Win32::System::SystemServices::SFGAO_FOLDER;
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
@@ -223,8 +224,46 @@ struct RecycleBinCandidate<T> {
     payload: T,
 }
 
+fn expand_long_path(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name().map(|n| n.to_os_string()) else {
+            return path.to_path_buf();
+        };
+        tail.push(name);
+        if !existing.pop() {
+            return path.to_path_buf();
+        }
+    }
+    let wide = HSTRING::from(existing.as_path());
+    let needed = unsafe { GetLongPathNameW(&wide, None) };
+    let mut resolved = if needed > 0 {
+        let mut buf = vec![0u16; needed as usize + 1];
+        let written = unsafe { GetLongPathNameW(&wide, Some(&mut buf)) } as usize;
+        if written > 0 && written <= buf.len() {
+            PathBuf::from(String::from_utf16_lossy(&buf[..written]))
+        } else {
+            existing
+        }
+    } else {
+        existing
+    };
+    for part in tail.into_iter().rev() {
+        resolved.push(part);
+    }
+    resolved
+}
+
+fn strip_bidi_controls(s: &str) -> String {
+    s.chars()
+        .filter(|&c| !matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+        .collect()
+}
+
 fn normalize_dir_key(path: &Path) -> String {
-    let raw = path.to_string_lossy();
+    let expanded = expand_long_path(path);
+    let raw = strip_bidi_controls(&expanded.to_string_lossy());
     let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
     let mut norm = stripped.replace('/', "\\").to_lowercase();
     while norm.len() > 3 && norm.ends_with('\\') {
@@ -256,8 +295,8 @@ fn select_recycle_matches<T>(original_paths: &[PathBuf], mut candidates: Vec<Rec
                 let Some(cand) = slot.as_ref() else { return false };
                 let Some(cand_dir) = cand.original_dir.as_deref() else { return false };
                 normalize_dir_key(cand_dir) == *target_dir
-                    && (cand.original_name.to_lowercase() == req_name
-                        || cand.fallback_display_name.to_lowercase() == req_name)
+                    && (strip_bidi_controls(&cand.original_name).to_lowercase() == req_name
+                        || strip_bidi_controls(&cand.fallback_display_name).to_lowercase() == req_name)
             });
         }
         if matched_idx.is_none() {
@@ -265,8 +304,8 @@ fn select_recycle_matches<T>(original_paths: &[PathBuf], mut candidates: Vec<Rec
             matched_idx = slots.iter().position(|slot| {
                 let Some(cand) = slot.as_ref() else { return false };
                 cand.original_dir.is_none()
-                    && (cand.original_name.to_lowercase() == req_name
-                        || cand.fallback_display_name.to_lowercase() == req_name)
+                    && (strip_bidi_controls(&cand.original_name).to_lowercase() == req_name
+                        || strip_bidi_controls(&cand.fallback_display_name).to_lowercase() == req_name)
             });
         }
         if let Some(idx) = matched_idx
@@ -885,6 +924,19 @@ mod tests {
         assert_eq!(delete(std::slice::from_ref(&file_a), false).unwrap(), 1);
         assert_eq!(delete(std::slice::from_ref(&file_b), false).unwrap(), 1);
         assert!(!file_a.exists() && !file_b.exists());
+
+        // On headless VMs where Recycle Bin is disabled on the temp volume, files are permanently
+        // deleted rather than placed in Recycle Bin. Only skip if neither item entered the bin at all.
+        let candidates = enumerate_recycle_bin_candidates().expect("enumerate recycle bin");
+        let saw_test_item = candidates.iter().any(|c| {
+            let n = strip_bidi_controls(&c.original_name).to_lowercase();
+            let f = strip_bidi_controls(&c.fallback_display_name).to_lowercase();
+            n == "same_name.txt" || f == "same_name.txt" || f == "same_name"
+        });
+        if !saw_test_item {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
 
         // Restore ONLY dir_b/same_name.txt — dir_a/same_name.txt must NOT be restored!
         let restored = restore_from_recycle_bin(std::slice::from_ref(&file_b)).expect("restore dir_b");
