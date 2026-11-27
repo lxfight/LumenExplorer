@@ -1158,6 +1158,8 @@ pub(crate) fn sort_key_str(key: SortKey) -> &'static str {
         SortKey::Type => "type",
         SortKey::Size => "size",
         SortKey::Extension => "extension",
+        SortKey::FreeSpace => "free_space",
+        SortKey::Location => "location",
     }
 }
 
@@ -1169,6 +1171,8 @@ pub(crate) fn parse_sort_key(text: &str) -> Option<SortKey> {
         "type" => Some(SortKey::Type),
         "size" => Some(SortKey::Size),
         "extension" => Some(SortKey::Extension),
+        "free_space" => Some(SortKey::FreeSpace),
+        "location" => Some(SortKey::Location),
         _ => None,
     }
 }

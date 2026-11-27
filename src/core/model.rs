@@ -20,6 +20,8 @@ pub enum SortKey {
     Type,
     Size,
     Extension,
+    FreeSpace,
+    Location,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
