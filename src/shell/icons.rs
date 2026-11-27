@@ -119,12 +119,11 @@ impl SharedQueue {
 
     fn push(&self, job: Job) -> Vec<u64> {
         let mut q = self.inner.lock().unwrap();
-        // Bound pending stack size: drop oldest off-screen items when user scrolls fast,
-        // returning evicted job IDs so `IconService` can reclaim `cached`, `by_key`, and `pending`.
-        let evicted = if q.stack.len() >= 512 { q.stack.drain(0..128).map(|j| j.id).collect() } else { Vec::new() };
+        // Bound pending stack size: drop oldest off-screen items when user scrolls fast.
+        let dropped = if q.stack.len() >= 512 { q.stack.drain(0..128).map(|job| job.id).collect() } else { Vec::new() };
         q.stack.push(job);
         self.cv.notify_one();
-        evicted
+        dropped
     }
 
     fn set_generation(&self, generation: u64) -> Vec<u64> {
@@ -214,6 +213,10 @@ impl IconService {
     pub fn bump_generation(&mut self) {
         self.generation += 1;
         let dropped = self.queue.set_generation(self.generation);
+        self.discard_pending(dropped);
+    }
+
+    fn discard_pending(&mut self, dropped: Vec<u64>) {
         for id in dropped {
             if let Some(entry) = self.cached.remove(&id) {
                 self.by_key.remove(&entry.key);
@@ -238,13 +241,8 @@ impl IconService {
             id,
             CachedIcon { key: key.clone(), texture: None, bytes: 0, completed: false, last_used: AtomicU64::new(tick) },
         );
-        let evicted = self.queue.push(Job { id, generation: self.generation, key });
-        for evicted_id in evicted {
-            if let Some(entry) = self.cached.remove(&evicted_id) {
-                self.by_key.remove(&entry.key);
-                self.pending = self.pending.saturating_sub(1);
-            }
-        }
+        let dropped = self.queue.push(Job { id, generation: self.generation, key });
+        self.discard_pending(dropped);
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
         }
@@ -655,6 +653,45 @@ fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_pressure_discards_bookkeeping_and_eventually_becomes_idle() {
+        // No workers: keep the queue full deterministically, as if Shell icon
+        // extraction were stalled while the user rapidly scrolls a large folder.
+        let (done_tx, done_rx) = unbounded();
+        let mut service = IconService {
+            queue: SharedQueue::new(),
+            done_rx,
+            next_id: 1,
+            generation: 0,
+            clock: AtomicU64::new(1),
+            by_key: HashMap::new(),
+            cached: HashMap::new(),
+            resident_bytes: 0,
+            completed_count: 0,
+            pending: 0,
+            ctx: None,
+        };
+        for index in 0..20_000 {
+            service.request(IconKey::file_type(format!("stress-{index}"), 16));
+            assert!(service.pending <= 512);
+            assert_eq!(service.pending, service.cached.len());
+            assert_eq!(service.pending, service.by_key.len());
+        }
+        assert!(!service.by_key.contains_key(&IconKey::file_type("stress-0", 16)));
+        let id = service.request(IconKey::file_type("stress-0", 16));
+        assert_eq!(service.by_key[&IconKey::file_type("stress-0", 16)], id, "dropped icons can be retried");
+        while let Some(job) = service.queue.inner.lock().unwrap().stack.pop() {
+            done_tx.send(Done { id: job.id, image: None }).unwrap();
+        }
+        service.poll(&egui::Context::default());
+        assert_eq!(service.pending, 0);
+        assert!(!service.is_busy(), "discarded tasks must not keep requesting redraws forever");
+        service.request(IconKey::file_type("next-folder", 16));
+        service.bump_generation();
+        assert!(!service.is_busy());
+        assert_eq!(service.cached.len(), service.completed_count);
+    }
 
     #[test]
     fn keeps_alpha_and_channel_order() {

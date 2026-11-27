@@ -25,6 +25,7 @@ use windows::Win32::UI::Shell::FOLDERID_ComputerFolder;
 
 pub const ROW_H: f32 = 30.0;
 pub const GROUP_H: f32 = 28.0;
+const HISTORY_LIMIT: usize = 256;
 
 /// Canonical Shell CLSID parsing name for "This PC" (locale-independent).
 pub const THIS_PC_PARSING: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
@@ -306,6 +307,9 @@ impl Tab {
         }
         self.history.truncate(self.history_pos + 1);
         self.history.push(location.clone());
+        if self.history.len() > HISTORY_LIMIT {
+            self.history.drain(..self.history.len() - HISTORY_LIMIT);
+        }
         self.history_pos = self.history.len() - 1;
         self.location = location;
         self.title = display_for(&self.location);
@@ -945,6 +949,39 @@ mod tests {
 
     fn names(entries: &[Entry]) -> Vec<&str> {
         entries.iter().map(|entry| entry.name.as_str()).collect()
+    }
+
+    #[test]
+    fn navigation_history_stays_bounded_and_preserves_back_forward_and_branching() {
+        let _com = Com::init();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let first = Location::from_path(root).unwrap();
+        let second = Location::from_path(&root.join("src")).unwrap();
+        let third = Location::from_path(&root.join("assets")).unwrap();
+        let mut tab = empty_tab(Vec::new(), None);
+        tab.history = vec![first.clone(); HISTORY_LIMIT];
+        tab.history_pos = HISTORY_LIMIT - 1;
+        let mut expected = tab.history.clone();
+        for location in [second.clone(), third.clone()].into_iter().cycle().take(20) {
+            expected.push(location.clone());
+            expected.remove(0);
+            tab.navigate(location, false, false);
+            assert_eq!(tab.history.len(), HISTORY_LIMIT);
+            assert_eq!(tab.history_pos, HISTORY_LIMIT - 1);
+            assert_eq!(tab.history[0].parsing_name(), expected[0].parsing_name());
+        }
+        tab.go_back(false, false);
+        assert_eq!(tab.location.parsing_name(), second.parsing_name());
+        tab.go_forward(false, false);
+        assert_eq!(tab.location.parsing_name(), third.parsing_name());
+        tab.go_back(false, false);
+        tab.navigate(first.clone(), false, false);
+        assert!(!tab.can_forward());
+        assert_eq!(tab.history.len(), HISTORY_LIMIT);
+        tab.go_back(false, false);
+        assert_eq!(tab.location.parsing_name(), second.parsing_name());
+        tab.go_forward(false, false);
+        assert_eq!(tab.location.parsing_name(), first.parsing_name());
     }
 
     #[test]

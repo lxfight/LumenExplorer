@@ -727,10 +727,9 @@ fn sync_pane_nav_generation(ctx: &egui::Context, pane_tag: u8, tab_uid: u64, nav
     let prev = ctx.data(|d| d.get_temp::<u64>(nav_id));
     if prev != Some(nav_gen) {
         if prev.is_some() {
-            crate::ui::spring::clear(ctx, egui::Id::unique(("pane-enter", pane_tag, tab_uid)));
-            crate::ui::spring::clear(ctx, egui::Id::unique(("list-scroll-spring", pane_tag, tab_uid)));
-            crate::ui::spring::clear(ctx, egui::Id::unique(("list-hscroll-spring", pane_tag, tab_uid)));
-            crate::ui::spring::clear(ctx, egui::Id::unique(("details-sel-bar-y", pane_tag, tab_uid)));
+            for name in ["pane-enter", "list-scroll-spring", "list-hscroll-spring", "details-sel-bar-y"] {
+                crate::ui::spring::generation_id(ctx, egui::Id::unique((name, pane_tag, tab_uid)), nav_gen);
+            }
             ctx.data_mut(|d| {
                 d.remove_temp::<f32>(egui::Id::unique(("list-hscroll-target", pane_tag, tab_uid)));
                 d.remove_temp::<f32>(egui::Id::unique(("details-sel-bar-last", pane_tag, tab_uid)));

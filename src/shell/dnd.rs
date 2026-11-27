@@ -14,16 +14,16 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::Context;
 use egui::{Pos2, Rect};
 use windows::Win32::Foundation::{
-    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_NOINTERFACE, POINT, POINTL, S_OK,
+    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_NOINTERFACE, GlobalFree, POINT, POINTL, S_OK,
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IBindCtx, IDataObject,
-    STGMEDIUM, TYMED_HGLOBAL,
+    STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
-use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{
     CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE, DoDragDrop, IDropSource,
     IDropSource_Vtbl, IDropTarget, IDropTarget_Vtbl, RegisterDragDrop, ReleaseStgMedium,
@@ -32,6 +32,7 @@ use windows::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON, MK_RBUTTON,
 /// `MK_ALT` (0x0020) from WinUser/OLE drag-drop key state flags.
 const MK_ALT: MODIFIERKEYS_FLAGS = MODIFIERKEYS_FLAGS(0x0020);
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     BHID_DataObject, CLSID_DragDropHelper, DragQueryFileW, HDROP, IDragSourceHelper, IShellItemArray,
@@ -208,7 +209,9 @@ fn choose_effect(
     } else if modifiers.contains(MK_SHIFT) && has(DROPEFFECT_MOVE) {
         DROPEFFECT_MOVE
     } else {
-        let source_only_copies = preferred.contains(DROPEFFECT_COPY) && !preferred.contains(DROPEFFECT_MOVE);
+        // Preferred DropEffect is advisory, not the source's allowed-effect mask.
+        // Chat clients prefer Copy; folder drops can still move on the same volume.
+        let source_only_copies = preferred.contains(DROPEFFECT_COPY) && !has(DROPEFFECT_MOVE);
         let same_vol = paths.first().is_some_and(|src| same_volume(src, dst));
         if source_only_copies || !same_vol {
             if has(DROPEFFECT_COPY) {
@@ -582,12 +585,42 @@ fn absolute_pidl(path: &Path) -> anyhow::Result<AbsolutePidl> {
 
 /// Shell data object for the given files, carrying CF_HDROP and shell ID lists.
 fn data_object(paths: &[PathBuf]) -> anyhow::Result<IDataObject> {
+    anyhow::ensure!(!paths.is_empty(), "no files to drag");
     let pidls = paths.iter().map(|path| absolute_pidl(path)).collect::<anyhow::Result<Vec<_>>>()?;
     let raw: Vec<*const ITEMIDLIST> = pidls.iter().map(|pidl| pidl.0.cast_const()).collect();
     let items: IShellItemArray =
         unsafe { SHCreateShellItemArrayFromIDLists(&raw) }.context("SHCreateShellItemArrayFromIDLists failed")?;
-    unsafe { items.BindToHandler(None::<&IBindCtx>, &BHID_DataObject) }
-        .context("IShellItemArray::BindToHandler(BHID_DataObject) failed")
+    let data: IDataObject = unsafe { items.BindToHandler(None::<&IBindCtx>, &BHID_DataObject) }
+        .context("IShellItemArray::BindToHandler(BHID_DataObject) failed")?;
+    // Materialize file paths before crossing process boundaries. Chat clients
+    // consume CF_HDROP directly instead of resolving Shell namespace items.
+    set_object_bytes(&data, &hdrop_format(), &super::clipboard::hdrop_bytes(paths))?;
+    let preferred = hglobal_format(unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) });
+    set_object_bytes(&data, &preferred, &DROPEFFECT_COPY.0.to_ne_bytes())?;
+    Ok(data)
+}
+
+fn set_object_bytes(data: &IDataObject, format: &FORMATETC, bytes: &[u8]) -> anyhow::Result<()> {
+    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }.context("allocate drag data")?;
+    let ptr = unsafe { GlobalLock(memory) }.cast::<u8>();
+    if ptr.is_null() {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        anyhow::bail!("lock drag data failed");
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+        let _ = GlobalUnlock(memory);
+    }
+    let medium = STGMEDIUM {
+        tymed: TYMED_HGLOBAL.0 as u32,
+        u: STGMEDIUM_0 { hGlobal: memory },
+        pUnkForRelease: std::mem::ManuallyDrop::new(None),
+    };
+    if let Err(err) = unsafe { data.SetData(format, &medium, true) } {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        return Err(err).context("publish drag data");
+    }
+    Ok(())
 }
 
 /// Starts an OLE drag of the given files and blocks until the drag finishes.
@@ -600,10 +633,14 @@ pub fn drag_out(paths: &[PathBuf]) -> anyhow::Result<()> {
     {
         let mut pt = POINT::default();
         let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) };
+        let _ = unsafe { ScreenToClient(crate::platform::hwnd(), &mut pt) };
         let _ = unsafe { helper.InitializeFromWindow(Some(crate::platform::hwnd()), Some(&pt), &data) };
     }
     let source = new_source();
     let mut effect = DROPEFFECT_NONE;
+    // winit captures the mouse for the file-row press. OLE must own capture
+    // while routing DragEnter/DragOver to windows in other processes.
+    let _ = unsafe { ReleaseCapture() };
     unsafe { DoDragDrop(&data, &source, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &mut effect) }
         .ok()
         .context("DoDragDrop failed")?;
@@ -617,6 +654,77 @@ mod tests {
     use windows::Win32::System::Com::{STGMEDIUM_0, TYMED_ISTREAM};
     use windows::Win32::System::Memory::{GMEM_FIXED, GlobalAlloc};
     use windows::Win32::System::SystemServices::{MK_CONTROL, MK_SHIFT};
+
+    #[test]
+    fn outgoing_files_advertise_hdrop_to_external_receivers() {
+        unsafe { windows::Win32::System::Ole::OleInitialize(None) }.unwrap();
+        let (_, _, files) = fixture_files();
+        let object = data_object(&files).unwrap();
+        unsafe { object.QueryGetData(&hdrop_format()) }.ok().expect("CF_HDROP must be advertised");
+        let formats = unsafe { object.EnumFormatEtc(windows::Win32::System::Com::DATADIR_GET.0 as u32) }.unwrap();
+        let mut advertised = false;
+        loop {
+            let mut entry = [FORMATETC::default()];
+            let mut fetched = 0;
+            if unsafe { formats.Next(&mut entry, Some(&mut fetched)) }.is_err() || fetched == 0 {
+                break;
+            }
+            if entry[0].cfFormat == CF_HDROP.0 && entry[0].tymed & TYMED_HGLOBAL.0 as u32 != 0 {
+                advertised = true;
+            }
+            unsafe { CoTaskMemFree(Some(entry[0].ptd.cast())) };
+        }
+        assert!(advertised, "external drop receivers must find CF_HDROP while enumerating formats");
+        assert_eq!(object_paths(&object), files);
+        assert_eq!(object_preferred_effect(&object), DROPEFFECT_COPY);
+        assert_eq!(object_paths(&object), files, "GetData may be called repeatedly by a receiver");
+
+        // A receiver in another COM apartment must obtain the same file list.
+        use windows::Win32::System::Com::Marshal::CoMarshalInterThreadInterfaceInStream;
+        use windows::Win32::System::Com::StructuredStorage::CoGetInterfaceAndReleaseStream;
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+        let stream = unsafe { CoMarshalInterThreadInterfaceInStream(&IDataObject::IID, &object) }.unwrap();
+        let stream_raw = stream.into_raw() as usize;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok().unwrap();
+            let stream = unsafe { windows::Win32::System::Com::IStream::from_raw(stream_raw as *mut c_void) };
+            // CoGetInterfaceAndReleaseStream consumes the stream reference itself.
+            let stream = std::mem::ManuallyDrop::new(stream);
+            let receiver: IDataObject = unsafe { CoGetInterfaceAndReleaseStream(&*stream) }.unwrap();
+            let received = (object_paths(&receiver), object_preferred_effect(&receiver));
+            drop(receiver);
+            unsafe { CoUninitialize() };
+            tx.send(received).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let received = loop {
+            if let Ok(received) = rx.try_recv() {
+                break received;
+            }
+            assert!(std::time::Instant::now() < deadline, "receiver timed out");
+            let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+            while unsafe {
+                windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                    &mut msg,
+                    None,
+                    0,
+                    0,
+                    windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+                )
+            }
+            .as_bool()
+            {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                    windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        thread.join().unwrap();
+        assert_eq!(received, (files, DROPEFFECT_COPY));
+    }
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -652,6 +760,10 @@ mod tests {
         let mut effect = all_allowed;
         unsafe { target.DragEnter(&data, MODIFIERKEYS_FLAGS(0), point, &mut effect) }.unwrap();
         assert_eq!(effect, DROPEFFECT_MOVE);
+
+        let mut copy_only = DROPEFFECT_COPY;
+        unsafe { target.DragOver(MODIFIERKEYS_FLAGS(0), point, &mut copy_only) }.unwrap();
+        assert_eq!(copy_only, DROPEFFECT_COPY, "copy-only receivers must not be offered a move");
 
         // Windows passes `dwOkEffect` (bitmask) into Drop; target must recompute and write back.
         let mut drop_effect = all_allowed;

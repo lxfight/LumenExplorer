@@ -831,7 +831,7 @@ impl LumenApp {
         } else {
             let rename_tip = if selected > 1 { "批量重命名  F2" } else { "重命名  F2" };
             let actions: [(&str, &str, bool, Command); 5] = [
-                (icons::DELETE, "删除  Del", has_sel, Command::Delete),
+                (icons::DELETE, "删除  Del / Ctrl+D", has_sel, Command::Delete),
                 (icons::RENAME, rename_tip, has_sel, Command::Rename),
                 (icons::PASTE, "粘贴  Ctrl+V", self.clipboard_files, Command::Paste),
                 (icons::COPY, "复制  Ctrl+C", has_sel, Command::Copy),
@@ -845,7 +845,7 @@ impl LumenApp {
             }
 
             if let Some(new_rect) = layout.new_rect {
-                let can_new = self.current_dir().is_some();
+                let can_new = self.current_dir().is_some() && !self.search_active();
                 if cmd_pill_button(
                     ui,
                     &painter,
@@ -854,11 +854,14 @@ impl LumenApp {
                     egui::Id::unique("cmd-new"),
                     icons::ADD,
                     "新建",
-                    "新建文件夹  Ctrl+Shift+N",
+                    "选择新建文件夹或文档（Ctrl+Shift+N 新建文件夹）",
                     can_new,
                     false,
                 ) {
-                    self.command(Command::NewFolder);
+                    self.menu_anchor = None;
+                    self.crumb_menu = None;
+                    self.ctx_menu =
+                        Some(crate::ui::context_menu::ContextMenuState::open_new(self, new_rect.left_bottom()));
                 }
             }
         }

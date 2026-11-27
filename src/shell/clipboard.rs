@@ -28,6 +28,10 @@ fn preferred_effect_format() -> u32 {
 
 static CLIPBOARD_LOCK: Mutex<()> = Mutex::new(());
 
+// A whole test transaction must own the desktop clipboard, beyond each API call.
+#[cfg(test)]
+pub(crate) static CLIPBOARD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 struct ClipboardGuard {
     _lock: MutexGuard<'static, ()>,
 }
@@ -104,7 +108,7 @@ fn replace_clipboard(entries: &[(u32, Vec<u8>)]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8> {
+pub(super) fn hdrop_bytes(paths: &[PathBuf]) -> Vec<u8> {
     let mut units: Vec<u16> = Vec::new();
     for path in paths {
         units.extend(path.as_os_str().encode_wide());
@@ -190,6 +194,15 @@ pub fn set_text(text: &str) -> anyhow::Result<()> {
 
 /// Reads plain Unicode text from the clipboard (capped to 1024 chars for quick path sensing).
 pub fn get_text() -> Option<String> {
+    read_text(1024)
+}
+
+/// TextEdit must receive the full text; path sensing intentionally reads less.
+pub fn get_text_for_paste() -> Option<String> {
+    read_text(usize::MAX)
+}
+
+fn read_text(limit: usize) -> Option<String> {
     if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32) }.is_err() {
         return None;
     }
@@ -204,7 +217,7 @@ pub fn get_text() -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    let max_units = (bytes / 2).min(1024);
+    let max_units = (bytes / 2).min(limit);
     let slice = unsafe { std::slice::from_raw_parts(ptr, max_units) };
     let len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
     let text = String::from_utf16_lossy(&slice[..len]);
@@ -326,21 +339,28 @@ mod tests {
     // replace its contents between a set and the following read, so retry the pair.
     fn expect_files(files: &[PathBuf], cut: bool) {
         let expected = (files.to_vec(), cut);
+        let mut last_read = None;
+        let mut last_error = None;
         for _ in 0..50 {
-            if set_files(files, cut).is_err() {
+            if let Err(err) = set_files(files, cut) {
+                last_error = Some(err.to_string());
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            if get_files() == Some(expected.clone()) {
+            last_read = get_files();
+            if last_read.as_ref() == Some(&expected) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("clipboard file round trip failed (cut={cut}): {:?}", get_files());
+        panic!(
+            "clipboard round trip failed: expected={expected:?}, last_read={last_read:?}, last_error={last_error:?}"
+        );
     }
 
     #[test]
     fn files_round_trip() {
+        let _clipboard = CLIPBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = fixture_dir();
         let files = [dir.join("alpha.txt"), dir.join("测试 文件.txt")];
         for file in &files {

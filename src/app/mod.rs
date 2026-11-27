@@ -4,6 +4,9 @@ mod background;
 mod commands;
 mod input;
 
+#[cfg(test)]
+mod stress;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -99,6 +102,7 @@ pub struct LumenApp {
     pub(crate) window_title: String,
     pub(crate) ime_enabled: bool,
     pub(crate) undo_stack: Vec<UndoEntry>,
+    pub(crate) restore_pending: bool,
     pub(crate) redo_stack: Vec<UndoEntry>,
     /// Text preview for the details pane, cached by (path, mtime).
     pub(crate) text_preview: Option<TextPreview>,
@@ -180,7 +184,7 @@ pub(crate) enum UndoEntry {
     Created { paths: Vec<PathBuf> },
     Copied { paths: Vec<PathBuf> },
     Moved { pairs: Vec<(PathBuf, PathBuf)> },
-    Deleted { items: Vec<PathBuf> },
+    Deleted { items: Vec<crate::shell::op_worker::RecycledItem> },
 }
 
 pub(crate) struct RenameState {
@@ -461,6 +465,7 @@ impl LumenApp {
             window_title: String::new(),
             ime_enabled: true,
             undo_stack: Vec::new(),
+            restore_pending: false,
             redo_stack: Vec::new(),
             text_preview: None,
             marquee: None,
@@ -1425,6 +1430,10 @@ pub(crate) fn same_dir_path(a: &Path, b: &Path) -> bool {
 }
 
 impl eframe::App for LumenApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.translate_clipboard_keys(raw_input);
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         if self.settings.mica_backdrop { [0.0, 0.0, 0.0, 0.0] } else { self.theme.bg_bottom.to_normalized_gamma_f32() }
     }
@@ -1666,6 +1675,7 @@ mod tests {
         // modifier state must arrive as an event before the key.
         raw.events.push(egui::Event::ModifiersChanged(modifiers));
         raw.events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers });
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
         let mut output = ctx.run_pass(raw, |ctx| app.handle_input(ctx));
         // A headless pass has no painter; the texture deltas must be consumed.
         output.textures_delta.clear();
@@ -1681,6 +1691,15 @@ mod tests {
 
     fn selected(app: &LumenApp) -> Vec<usize> {
         app.active().selection.iter().copied().collect()
+    }
+
+    fn finish_restore(app: &mut LumenApp, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.restore_pending && std::time::Instant::now() < deadline {
+            app.poll_background(ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.restore_pending, "background restore must report completion");
     }
 
     const NONE: egui::Modifiers = egui::Modifiers::NONE;
@@ -1803,6 +1822,196 @@ mod tests {
         assert_eq!(selected(&app), vec![4], "Left must step -1 in grid");
         press(&mut app, &ctx, egui::Key::ArrowUp, NONE);
         assert_eq!(selected(&app), vec![0], "Up must step -grid_columns in grid");
+    }
+
+    #[test]
+    fn ctrl_z_restores_a_worker_delete_and_keeps_failed_undo_for_retry() {
+        let _com = Com::init();
+        let stamp = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("tmp")
+            .join(format!("ctrl-z-delete-{stamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("撤销测试.txt");
+        std::fs::write(&path, b"restore me").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = LumenApp::with_context(&ctx, settings_for(&root));
+        app.op_worker
+            .submit(crate::shell::op_worker::OpRequest::Delete { items: vec![path.clone()], permanent: false });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.undo_stack.is_empty() && std::time::Instant::now() < deadline {
+            app.poll_background(&ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.undo_stack.len(), 1, "worker result must register an undo");
+        assert!(!path.exists());
+        press(&mut app, &ctx, egui::Key::Z, egui::Modifiers::CTRL);
+        assert!(app.restore_pending, "Ctrl+Z must queue restoration instead of running Shell on the UI thread");
+        finish_restore(&mut app, &ctx);
+        assert_eq!(std::fs::read(&path).unwrap(), b"restore me");
+        assert!(app.undo_stack.is_empty());
+
+        app.push_undo(UndoEntry::Deleted {
+            items: vec![crate::shell::op_worker::RecycledItem { original: path.clone(), pidl: Vec::new() }],
+        });
+        press(&mut app, &ctx, egui::Key::Z, egui::Modifiers::CTRL);
+        assert!(app.restore_pending);
+        // A second undo while restore is in flight must leave older history alone.
+        app.undo_stack.insert(0, UndoEntry::Created { paths: vec![path.clone()] });
+        app.command(Command::Undo);
+        assert_eq!(app.undo_stack.len(), 1);
+        finish_restore(&mut app, &ctx);
+        assert_eq!(app.undo_stack.len(), 2, "failed restore must remain retryable and keep older history");
+        assert_eq!(std::fs::read(&path).unwrap(), b"restore me");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clipboard_shortcuts_copy_and_cut_files_with_navigation_pane_focus() {
+        let _clipboard = crate::shell::clipboard::CLIPBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _com = Com::init();
+        let stamp = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("tmp").join(format!("ctrl-v-{stamp}"));
+        let source_dir = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = LumenApp::with_context(&ctx, settings_for(&source_dir));
+
+        for (cut, key) in [(false, egui::Key::C), (true, egui::Key::X)] {
+            let name = if cut { "剪切测试.txt" } else { "复制测试.txt" };
+            let source = source_dir.join(name);
+            std::fs::write(&source, b"clipboard contents").unwrap();
+            app.navigate_to_path(&source_dir);
+            let mut item = entry(name);
+            item.path = Some(source.clone());
+            let tab = app.active_mut();
+            tab.entries = std::sync::Arc::new(vec![item]);
+            tab.stats.total = 1;
+            tab.rebuild_display();
+            tab.select_row(0, NONE);
+            // Other desktop processes can briefly lock or replace the shared clipboard.
+            for _ in 0..50 {
+                press(&mut app, &ctx, key, egui::Modifiers::CTRL);
+                if crate::shell::clipboard::get_files() == Some((vec![source.clone()], cut)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(crate::shell::clipboard::get_files(), Some((vec![source.clone()], cut)));
+            assert!(crate::shell::clipboard::get_text().is_none(), "fixture must have no text format");
+            app.navigate_to_path(&destination);
+            app.sidebar_focused = true;
+            let undo_count = app.undo_stack.len();
+            press(&mut app, &ctx, egui::Key::V, egui::Modifiers::CTRL);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while app.undo_stack.len() == undo_count && std::time::Instant::now() < deadline {
+                app.poll_background(&ctx);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(std::fs::read(destination.join(name)).unwrap(), b"clipboard contents");
+            assert_eq!(source.exists(), !cut);
+            assert_eq!(app.undo_stack.len(), undo_count + 1, "paste must execute once");
+            if cut {
+                assert!(crate::shell::clipboard::get_files().is_none(), "completed cut-paste clears file clipboard");
+            }
+        }
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clipboard_shortcuts_keep_full_text_paste_in_text_editors() {
+        let _clipboard = crate::shell::clipboard::CLIPBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _com = Com::init();
+        let (mut app, ctx) = app_with(Vec::new());
+        app.address.editing = true;
+        let text = "剪贴板文本".repeat(400);
+        let id = egui::Id::unique("paste-text-edit");
+        let mut value = String::new();
+        let mut first = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            let mut ui = egui::Ui::new(ctx.clone(), egui::Id::unique("paste-text-ui"), egui::UiBuilder::new());
+            ui.add(egui::TextEdit::singleline(&mut value).id(id)).request_focus();
+        });
+        first.textures_delta.clear();
+        let mut raw = egui::RawInput::default();
+        // Clipboard listeners outside this process may briefly lock or replace it.
+        // Capture a verified paste event before testing TextEdit's consumption.
+        for _ in 0..50 {
+            raw.events = vec![egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }];
+            if crate::shell::clipboard::set_text(&text).is_ok() {
+                eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+                if matches!(raw.events.first(), Some(egui::Event::Paste(value)) if value == &text) {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(raw.events.first(), Some(egui::Event::Paste(value)) if value == &text));
+        let mut output = ctx.run_pass(raw, |ctx| {
+            app.handle_input(ctx);
+            let mut ui = egui::Ui::new(ctx.clone(), egui::Id::unique("paste-text-ui"), egui::UiBuilder::new());
+            ui.add(egui::TextEdit::singleline(&mut value).id(id));
+        });
+        output.textures_delta.clear();
+        assert_eq!(value, text, "text pastes must not use the 1024-character path-sensing limit");
+        assert!(!app.op_worker.is_busy());
+        crate::shell::clipboard::clear().unwrap();
+    }
+
+    #[test]
+    fn ctrl_d_deletes_the_selected_item() {
+        let _com = Com::init();
+        let stamp = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("tmp")
+            .join(format!("ctrl-d-delete-{stamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("ctrl-d.txt");
+        std::fs::write(&path, b"delete me").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = LumenApp::with_context(&ctx, settings_for(&root));
+        let tab = app.active_mut();
+        tab.entries = std::sync::Arc::new(vec![Entry {
+            name: "ctrl-d.txt".to_string(),
+            path: Some(path.clone()),
+            is_folder: false,
+            size: 9,
+            modified: None,
+            created: None,
+            kind: "文本文档".to_string(),
+            free_space: 0,
+            ext: "txt".to_string(),
+            file_attrs: 0,
+            pidl: None,
+        }]);
+        tab.stats.total = 1;
+        tab.rebuild_display();
+        tab.select_row(0, egui::Modifiers::NONE);
+        press(&mut app, &ctx, egui::Key::D, egui::Modifiers::CTRL);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.undo_stack.is_empty() && std::time::Instant::now() < deadline {
+            app.poll_background(&ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!path.exists(), "Ctrl+D must submit the normal recycle-bin delete");
+        assert_eq!(app.undo_stack.len(), 1);
+        press(&mut app, &ctx, egui::Key::Z, egui::Modifiers::CTRL);
+        finish_restore(&mut app, &ctx);
+        assert_eq!(std::fs::read(&path).unwrap(), b"delete me");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

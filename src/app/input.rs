@@ -6,6 +6,34 @@ use crate::platform;
 use super::{Command, LumenApp, RenameState, now};
 
 impl LumenApp {
+    /// Keep file-only pastes, which egui-winit's default text/image handler drops.
+    /// Translate text editing shortcuts too, so TextEdit retains clipboard support.
+    pub(super) fn translate_clipboard_keys(&self, input: &mut egui::RawInput) {
+        let editing_text = self.address.editing
+            || self.rename.is_some()
+            || self.search_focused
+            || self.dialog.is_some()
+            || self.settings_open;
+        for event in &mut input.events {
+            let egui::Event::Key { key, pressed: true, modifiers, .. } = event else { continue };
+            let ctrl_only = modifiers.ctrl && !modifiers.shift && !modifiers.alt;
+            let shift_only = modifiers.shift && !modifiers.ctrl && !modifiers.alt;
+            *event = match *key {
+                egui::Key::C if ctrl_only => egui::Event::Copy,
+                egui::Key::X if ctrl_only => egui::Event::Cut,
+                egui::Key::Insert if ctrl_only => egui::Event::Copy,
+                egui::Key::Delete if shift_only && editing_text => egui::Event::Cut,
+                egui::Key::V if ctrl_only => egui::Event::Paste(
+                    crate::shell::clipboard::get_text_for_paste().unwrap_or_default().replace("\r\n", "\n"),
+                ),
+                egui::Key::Insert if shift_only => egui::Event::Paste(
+                    crate::shell::clipboard::get_text_for_paste().unwrap_or_default().replace("\r\n", "\n"),
+                ),
+                _ => continue,
+            };
+        }
+    }
+
     // ---- input -----------------------------------------------------------
 
     pub(super) fn handle_input(&mut self, ctx: &egui::Context) {
@@ -96,7 +124,7 @@ impl LumenApp {
                     }
                     continue;
                 }
-                egui::Event::Paste(_) => {
+                egui::Event::Paste(_) | egui::Event::PasteImage(_) => {
                     if !handled_paste {
                         handled_paste = true;
                         self.paste();
@@ -158,6 +186,7 @@ impl LumenApp {
             Key::Tab if ctrl_only => self.command(Command::NextTab),
             Key::N if ctrl_shift => self.command(Command::NewFolder),
             Key::H if ctrl_only => self.command(Command::ToggleHidden),
+            Key::D if ctrl_only => self.command(Command::Delete),
             Key::D if ctrl_shift => self.cycle_theme(ctx),
             Key::I if ctrl_shift => self.command(Command::InvertSelection),
             Key::Z if ctrl_shift => self.command(Command::Redo),

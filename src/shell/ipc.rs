@@ -11,7 +11,8 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
@@ -247,7 +248,12 @@ fn serve_pipe_loop(pipe_name: &str, tx: Sender<LaunchTarget>, stop_on_quit: bool
         }
         let connected = match unsafe { ConnectNamedPipe(pipe, None) } {
             Ok(()) => true,
-            Err(err) => err.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0),
+            Err(err) => {
+                // A client may have written and closed before we reach ConnectNamedPipe.
+                // ERROR_NO_DATA still leaves its buffered request available to ReadFile.
+                err.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0)
+                    || err.code() == windows::core::HRESULT::from_win32(ERROR_NO_DATA.0)
+            }
         };
         // Pre-create the next listening instance before reading/disconnecting/closing
         // the current one so there is never a gap with zero listening pipe instances.

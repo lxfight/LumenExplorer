@@ -54,7 +54,14 @@ fn main() -> eframe::Result {
         viewport = viewport.with_position([x, y]);
     }
 
-    let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Glow, ..Default::default() };
+    let options = eframe::NativeOptions {
+        viewport,
+        renderer: eframe::Renderer::Glow,
+        // The backend's text-only paste translation discards CF_HDROP file pastes.
+        // Lumen translates clipboard keys in App::raw_input_hook instead.
+        clipboard_shortcuts: false,
+        ..Default::default()
+    };
 
     eframe::run_native(
         "Lumen",

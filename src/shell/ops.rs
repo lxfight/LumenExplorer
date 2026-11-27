@@ -8,28 +8,21 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
-use windows::Win32::Foundation::{HWND, PROPERTYKEY};
-use windows::Win32::Storage::EnhancedStorage::{PKEY_DateModified, PKEY_FileName};
 #[cfg(test)]
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, IBindCtx, IDataObject, IPersistFile};
-use windows::Win32::System::SystemServices::SFGAO_FOLDER;
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
-use windows::Win32::UI::Shell::Common::{ITEMIDLIST, SHELLDETAILS, STRRET};
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    BHID_SFObject, BHID_SFUIObject, CMINVOKECOMMANDINFOEX, FOLDERID_RecycleBinFolder, IContextMenu, IEnumIDList,
-    ILCombine, ILFindLastID, ILFree, IShellFolder, IShellFolder2, IShellItem2, IShellItemArray, IShellLinkW,
-    OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OPENASINFO, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
-    SHCreateDataObject, SHCreateItemFromIDList, SHCreateShellItemArrayFromIDLists, SHEmptyRecycleBinW,
-    SHGDN_FOREDITING, SHGDN_INFOLDER, SHGDN_NORMAL, SHGDNF, SHMultiFileProperties, SHOP_FILEPATH, SHObjectProperties,
-    SHOpenWithDialog, SHParseDisplayName, SIGDN_FILESYSPATH, SIGDN_PARENTRELATIVEEDITING, ShellExecuteW, ShellLink,
-    StrRetToBufW,
+    BHID_SFUIObject, CMINVOKECOMMANDINFOEX, FOF_ALLOWUNDO, FileOperation, IContextMenu, IFileOperation,
+    IFileOperationProgressSink, ILFindLastID, ILFree, IShellItem, IShellItemArray, IShellLinkW,
+    OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OPENASINFO, SHCreateDataObject, SHCreateItemFromIDList,
+    SHCreateItemFromParsingName, SHCreateShellItemArrayFromIDLists, SHEmptyRecycleBinW, SHMultiFileProperties,
+    SHOP_FILEPATH, SHObjectProperties, SHOpenWithDialog, SHParseDisplayName, ShellExecuteW, ShellLink,
 };
 #[cfg(test)]
 use windows::Win32::UI::Shell::{
-    FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING,
-    FOFX_RECYCLEONDELETE, FileOperation, IFileOperation, IFileOperationProgressSink, IShellItem,
-    SHCreateItemFromParsingName,
+    FILEOPERATION_FLAGS, FOF_NOCONFIRMATION, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING, FOFX_RECYCLEONDELETE,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, Interface, PCSTR, PCWSTR};
@@ -209,221 +202,31 @@ pub fn eject_drive(root: &Path) -> anyhow::Result<()> {
     invoke_pidl_verb(&[std::sync::Arc::new(pidl)], "eject")
 }
 
-// PSGUID_DISPLACED {9B174B33-40FF-11D2-A27E-00C04FC30871}
-const PKEY_RECYCLE_DELETED_FROM: PROPERTYKEY =
-    PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0x9b174b33_40ff_11d2_a27e_00c04fc30871), pid: 2 };
-const PKEY_RECYCLE_DATE_DELETED: PROPERTYKEY =
-    PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0x9b174b33_40ff_11d2_a27e_00c04fc30871), pid: 3 };
-
-struct RecycleBinCandidate<T> {
-    original_dir: Option<PathBuf>,
-    original_name: String,
-    fallback_display_name: String,
-    deleted_ticks: u64,
-    payload: T,
-}
-
-fn normalize_dir_key(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    let mut norm = stripped.replace('/', "\\").to_lowercase();
-    while norm.len() > 3 && norm.ends_with('\\') {
-        norm.pop();
-    }
-    let bytes = norm.as_bytes();
-    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        norm.push('\\');
-    }
-    norm
-}
-
-fn select_recycle_matches<T>(original_paths: &[PathBuf], mut candidates: Vec<RecycleBinCandidate<T>>) -> Vec<T> {
-    // Prefer the most recently deleted item when multiple historical copies share the same path.
-    candidates.sort_by_key(|a| std::cmp::Reverse(a.deleted_ticks));
-    let mut slots: Vec<Option<RecycleBinCandidate<T>>> = candidates.into_iter().map(Some).collect();
-    let mut selected = Vec::new();
-
-    for req in original_paths {
-        let Some(req_name) = req.file_name().map(|n| n.to_string_lossy().to_lowercase()) else {
-            continue;
-        };
-        let req_dir = req.parent().map(normalize_dir_key);
-
-        let mut matched_idx = None;
-        if let Some(target_dir) = &req_dir {
-            // Pass 1: exact (original_dir, original_name) match; never match another directory.
-            matched_idx = slots.iter().position(|slot| {
-                let Some(cand) = slot.as_ref() else { return false };
-                let Some(cand_dir) = cand.original_dir.as_deref() else { return false };
-                normalize_dir_key(cand_dir) == *target_dir
-                    && (cand.original_name.to_lowercase() == req_name
-                        || cand.fallback_display_name.to_lowercase() == req_name)
-            });
-        }
-        if matched_idx.is_none() {
-            // Pass 2: graceful fallback ONLY for items whose original directory property could not be queried.
-            matched_idx = slots.iter().position(|slot| {
-                let Some(cand) = slot.as_ref() else { return false };
-                cand.original_dir.is_none()
-                    && (cand.original_name.to_lowercase() == req_name
-                        || cand.fallback_display_name.to_lowercase() == req_name)
-            });
-        }
-        if let Some(idx) = matched_idx
-            && let Some(cand) = slots[idx].take()
-        {
-            selected.push(cand.payload);
-        }
-    }
-    selected
-}
-
-fn strret_to_string(strret: &mut STRRET) -> Option<String> {
-    let mut buf = [0u16; 1024];
-    unsafe { StrRetToBufW(strret, None, &mut buf) }.ok()?;
-    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Some(String::from_utf16_lossy(&buf[..end]))
-}
-
-fn folder2_detail_column(folder2: &IShellFolder2, child: *const ITEMIDLIST, column: u32) -> Option<String> {
-    let mut details = SHELLDETAILS::default();
-    unsafe { folder2.GetDetailsOf(child, column, &mut details) }.ok()?;
-    let mut sr = unsafe { std::ptr::read_unaligned(std::ptr::addr_of!(details.str)) };
-    strret_to_string(&mut sr)
-}
-
-fn enumerate_recycle_bin_candidates() -> anyhow::Result<Vec<RecycleBinCandidate<std::sync::Arc<crate::shell::Pidl>>>> {
-    let bin = crate::shell::location::Location::known(&FOLDERID_RecycleBinFolder)?;
-    let folder: IShellFolder = unsafe { bin.shell_item().BindToHandler(None, &BHID_SFObject) }
-        .map_err(|e| anyhow!("无法打开回收站 Shell 文件夹: {e}"))?;
-    let folder2: Option<IShellFolder2> = folder.cast().ok();
-    let flags = SHCONTF_FOLDERS.0 as u32 | SHCONTF_NONFOLDERS.0 as u32 | SHCONTF_INCLUDEHIDDEN.0 as u32;
-    let mut enumerator: Option<IEnumIDList> = None;
-    unsafe { folder.EnumObjects(HWND(std::ptr::null_mut()), flags, &mut enumerator) }
-        .ok()
-        .map_err(|e| anyhow!("无法枚举回收站项目: {e}"))?;
-    let Some(enumerator) = enumerator else {
-        return Ok(Vec::new());
-    };
-
-    let mut out = Vec::new();
-    loop {
-        let mut items: [*mut ITEMIDLIST; 1] = [std::ptr::null_mut()];
-        let mut fetched = 0u32;
-        let hr = unsafe { enumerator.Next(&mut items, Some(&mut fetched)) };
-        let child = items[0];
-        if hr.0 < 0 || fetched == 0 || child.is_null() {
-            break;
-        }
-        let abs_ptr = unsafe { ILCombine(Some(bin.pidl()), Some(child)) };
-        if !abs_ptr.is_null() {
-            let pidl = std::sync::Arc::new(crate::shell::Pidl::from_raw(abs_ptr));
-            let item: Option<IShellItem2> = unsafe { SHCreateItemFromIDList(abs_ptr).ok() };
-
-            let mut sfgao = SFGAO_FOLDER.0;
-            let is_folder =
-                unsafe { folder.GetAttributesOf(&[child], &mut sfgao) }.is_ok() && (sfgao & SFGAO_FOLDER.0 != 0);
-
-            let mut normal_sr = STRRET::default();
-            let normal_name = unsafe { folder.GetDisplayNameOf(child, SHGDN_NORMAL, &mut normal_sr) }
-                .ok()
-                .and_then(|()| strret_to_string(&mut normal_sr))
-                .unwrap_or_default();
-
-            let mut edit_sr = STRRET::default();
-            let editing_name = item
-                .as_ref()
-                .and_then(|it| unsafe { it.GetDisplayName(SIGDN_PARENTRELATIVEEDITING) }.ok())
-                .map(crate::shell::location::take_pwstr)
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    unsafe {
-                        folder.GetDisplayNameOf(child, SHGDNF(SHGDN_INFOLDER.0 | SHGDN_FOREDITING.0), &mut edit_sr)
-                    }
-                    .ok()
-                    .and_then(|()| strret_to_string(&mut edit_sr))
-                    .filter(|s| !s.is_empty())
-                })
-                .or_else(|| {
-                    folder2.as_ref().and_then(|f2| folder2_detail_column(f2, child, 0)).filter(|s| !s.is_empty())
-                });
-
-            let pkey_name = item
-                .as_ref()
-                .and_then(|it| unsafe { it.GetString(&PKEY_FileName) }.ok())
-                .map(crate::shell::location::take_pwstr)
-                .filter(|s| !s.is_empty());
-
-            let mut original_name = pkey_name.or(editing_name).unwrap_or_else(|| normal_name.clone());
-
-            // Even if Windows "Hide extensions for known file types" strips extensions from
-            // display names, the physical `$R*` backing path inside `$Recycle.Bin` keeps the
-            // real file extension intact.
-            if !is_folder
-                && let Some(phys) = item
-                    .as_ref()
-                    .and_then(|it| unsafe { it.GetDisplayName(SIGDN_FILESYSPATH) }.ok())
-                    .map(crate::shell::location::take_pwstr)
-                    .filter(|s| !s.is_empty())
-                && let Some(ext) = Path::new(&phys).extension().and_then(|e| e.to_str())
-                && !ext.is_empty()
-            {
-                let suffix = format!(".{ext}");
-                if original_name.len() < suffix.len()
-                    || !original_name[original_name.len() - suffix.len()..].eq_ignore_ascii_case(&suffix)
-                {
-                    original_name.push_str(&suffix);
-                }
-            }
-
-            let original_dir = item
-                .as_ref()
-                .and_then(|it| unsafe { it.GetString(&PKEY_RECYCLE_DELETED_FROM) }.ok())
-                .map(crate::shell::location::take_pwstr)
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    folder2.as_ref().and_then(|f2| folder2_detail_column(f2, child, 1)).filter(|s| !s.is_empty())
-                })
-                .map(PathBuf::from);
-
-            let deleted_ticks = item
-                .as_ref()
-                .and_then(|it| {
-                    unsafe { it.GetFileTime(&PKEY_RECYCLE_DATE_DELETED) }
-                        .or_else(|_| unsafe { it.GetFileTime(&PKEY_DateModified) })
-                        .ok()
-                })
-                .map(|ft| ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64)
-                .unwrap_or(0);
-
-            out.push(RecycleBinCandidate {
-                original_dir,
-                original_name,
-                fallback_display_name: normal_name,
-                deleted_ticks,
-                payload: pidl,
-            });
-        }
-        unsafe { ILFree(Some(child as *const ITEMIDLIST)) };
-    }
-    Ok(out)
-}
-
-/// Restores recently deleted paths from the Windows Recycle Bin by matching each
-/// target's `(original_dir, original_name)` via Recycle Bin shell properties,
-/// preferring the most recently deleted entry and consuming each match once.
-pub fn restore_from_recycle_bin(original_paths: &[PathBuf]) -> anyhow::Result<usize> {
-    if original_paths.is_empty() {
+/// Restores only the recycled Shell items captured by the delete operation.
+pub fn restore_from_recycle_bin(items: &[crate::shell::op_worker::RecycledItem]) -> anyhow::Result<usize> {
+    if items.is_empty() {
         return Ok(0);
     }
-    let candidates = enumerate_recycle_bin_candidates()?;
-    let to_restore = select_recycle_matches(original_paths, candidates);
-    if to_restore.is_empty() {
-        return Err(anyhow!("回收站中未找到可还原的项目"));
+    let op: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) }?;
+    unsafe { op.SetOperationFlags(FOF_ALLOWUNDO) }?;
+    let hwnd = crate::platform::hwnd();
+    if !hwnd.0.is_null() {
+        unsafe { op.SetOwnerWindow(hwnd) }?;
     }
-    let count = to_restore.len();
-    invoke_pidl_verb(&to_restore, "undelete")?;
-    Ok(count)
+    for item in items {
+        let parent = item.original.parent().ok_or_else(|| anyhow!("无法确定还原目录"))?;
+        let name = item.original.file_name().ok_or_else(|| anyhow!("无法确定还原文件名"))?;
+        let pidl = crate::shell::Pidl::from_bytes(&item.pidl).ok_or_else(|| anyhow!("回收站项目标识无效"))?;
+        let source: IShellItem = unsafe { SHCreateItemFromIDList(pidl.as_ptr()) }?;
+        let destination: IShellItem =
+            unsafe { SHCreateItemFromParsingName(&HSTRING::from(parent), None::<&IBindCtx>) }?;
+        unsafe { op.MoveItem(&source, &destination, &HSTRING::from(name), None::<&IFileOperationProgressSink>) }?;
+    }
+    unsafe { op.PerformOperations() }?;
+    if unsafe { op.GetAnyOperationsAborted() }?.as_bool() {
+        return Err(anyhow!("还原已取消，可再次按 Ctrl+Z 重试"));
+    }
+    Ok(items.len())
 }
 
 /// Creates a Windows `.lnk` shortcut pointing to `target` inside `dest_dir`.
@@ -810,67 +613,6 @@ mod tests {
     }
 
     #[test]
-    fn select_recycle_matches_uses_dir_recency_and_consumes_once() {
-        let candidates = vec![
-            RecycleBinCandidate {
-                original_dir: Some(PathBuf::from(r"C:\Other")),
-                original_name: "notes.txt".into(),
-                fallback_display_name: "notes".into(),
-                deleted_ticks: 900,
-                payload: "other-dir",
-            },
-            RecycleBinCandidate {
-                original_dir: Some(PathBuf::from(r"C:\Work\Docs")),
-                original_name: "notes.txt".into(),
-                fallback_display_name: "notes".into(),
-                deleted_ticks: 100,
-                payload: "older-work",
-            },
-            RecycleBinCandidate {
-                original_dir: Some(PathBuf::from(r"C:\work\docs\")),
-                original_name: "NOTES.TXT".into(),
-                fallback_display_name: "NOTES".into(),
-                deleted_ticks: 500,
-                payload: "newer-work",
-            },
-        ];
-
-        // Single request must match ONLY the newest entry in C:\Work\Docs, never C:\Other or older copy.
-        let picked = select_recycle_matches(&[PathBuf::from(r"C:\Work\Docs\notes.txt")], candidates);
-        assert_eq!(picked, vec!["newer-work"]);
-
-        // Requesting a path whose directory does not match any candidate with a known original_dir
-        // must never restore unrelated files from other directories.
-        let unrelated = vec![RecycleBinCandidate {
-            original_dir: Some(PathBuf::from(r"D:\Archive")),
-            original_name: "notes.txt".into(),
-            fallback_display_name: "notes".into(),
-            deleted_ticks: 1000,
-            payload: "wrong-dir",
-        }];
-        assert!(select_recycle_matches(&[PathBuf::from(r"C:\Work\notes.txt")], unrelated).is_empty());
-
-        // Fallback works only when original_dir property was unavailable (None) and still consumes once.
-        let fallback_cands = vec![
-            RecycleBinCandidate {
-                original_dir: None,
-                original_name: "notes.txt".into(),
-                fallback_display_name: "notes".into(),
-                deleted_ticks: 10,
-                payload: "fb-old",
-            },
-            RecycleBinCandidate {
-                original_dir: None,
-                original_name: "notes.txt".into(),
-                fallback_display_name: "notes".into(),
-                deleted_ticks: 20,
-                payload: "fb-new",
-            },
-        ];
-        assert_eq!(select_recycle_matches(&[PathBuf::from(r"C:\Any\notes.txt")], fallback_cands), vec!["fb-new"]);
-    }
-
-    #[test]
     fn restore_from_recycle_bin_only_restores_matching_directory() {
         let _com = ComApartment::init();
         let root = temp_dir("recycle-restore");
@@ -882,19 +624,36 @@ mod tests {
         let file_a = new_file(&dir_a, "same_name.txt", b"from-a").unwrap();
         let file_b = new_file(&dir_b, "same_name.txt", b"from-b").unwrap();
 
-        assert_eq!(delete(std::slice::from_ref(&file_a), false).unwrap(), 1);
-        assert_eq!(delete(std::slice::from_ref(&file_b), false).unwrap(), 1);
+        let worker = crate::shell::op_worker::OpWorker::new();
+        let recycle = |path: &PathBuf| {
+            use crate::shell::op_worker::{OpRequest, OpResult};
+            worker.submit(OpRequest::Delete { items: vec![path.clone()], permanent: false });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(finished) = worker.poll().into_iter().next() {
+                    let OpResult::Deleted { items, count, .. } = finished.result.unwrap() else {
+                        panic!("expected delete result")
+                    };
+                    assert_eq!(count, 1);
+                    return items;
+                }
+                assert!(std::time::Instant::now() < deadline, "delete timed out");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let recycled_a = recycle(&file_a);
+        let recycled_b = recycle(&file_b);
         assert!(!file_a.exists() && !file_b.exists());
 
         // Restore ONLY dir_b/same_name.txt — dir_a/same_name.txt must NOT be restored!
-        let restored = restore_from_recycle_bin(std::slice::from_ref(&file_b)).expect("restore dir_b");
+        let restored = restore_from_recycle_bin(&recycled_b).expect("restore dir_b");
         assert_eq!(restored, 1);
         assert!(file_b.exists(), "expected dir_b/same_name.txt to be restored");
         assert_eq!(std::fs::read(&file_b).unwrap(), b"from-b");
         assert!(!file_a.exists(), "unrelated dir_a/same_name.txt must stay in Recycle Bin");
 
         // Restore dir_a/same_name.txt too so we don't leave test junk in the Recycle Bin.
-        let restored_a = restore_from_recycle_bin(std::slice::from_ref(&file_a)).expect("restore dir_a");
+        let restored_a = restore_from_recycle_bin(&recycled_a).expect("restore dir_a");
         assert_eq!(restored_a, 1);
         assert!(file_a.exists());
         assert_eq!(std::fs::read(&file_a).unwrap(), b"from-a");
