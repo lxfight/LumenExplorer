@@ -1,4 +1,4 @@
-﻿//! Command dispatch, file operations, search, undo/redo, rename, and context menus.
+//! Command dispatch, file operations, search, undo/redo, rename, and context menus.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -9,9 +9,11 @@ use crate::core::ViewMode;
 use crate::core::tabs::Tab;
 use crate::platform;
 use crate::shell::location::Location;
-use crate::shell::op_worker::OpRequest;
+use crate::shell::op_worker::{OpOrigin, OpRequest};
 
-use super::{Command, Dialog, LumenApp, RenameState, UndoEntry, batch_rename_preview, unique_name};
+use super::{
+    Command, Dialog, LumenApp, RenameState, UndoEntry, apply_folder_view_to_tab, batch_rename_preview, unique_name,
+};
 
 impl LumenApp {
     // ---- commands --------------------------------------------------------
@@ -32,11 +34,16 @@ impl LumenApp {
                 }
             }
             Command::NewTab => {
+                self.save_active_search_snapshot();
                 let location = self.active().location.clone();
                 self.focus_secondary = false;
                 self.tabs.push(Tab::new(location, self.show_hidden, self.show_system));
                 self.active = self.tabs.len() - 1;
+                self.rename = None;
+                self.typed.buf.clear();
+                self.restore_active_search_snapshot();
                 self.icons.bump_generation();
+                self.apply_folder_view();
                 self.sync_watch();
             }
             Command::ReopenClosedTab => {
@@ -46,9 +53,13 @@ impl LumenApp {
                 };
                 match Location::parse(&parsing) {
                     Ok(loc) => {
+                        self.save_active_search_snapshot();
                         self.focus_secondary = false;
                         self.tabs.push(Tab::new(loc, self.show_hidden, self.show_system));
                         self.active = self.tabs.len() - 1;
+                        self.rename = None;
+                        self.typed.buf.clear();
+                        self.restore_active_search_snapshot();
                         self.icons.bump_generation();
                         self.apply_folder_view();
                         self.sync_watch();
@@ -58,13 +69,12 @@ impl LumenApp {
             }
             Command::ToggleSplitView => {
                 if self.secondary_tab.is_some() {
-                    self.secondary_tab = None;
-                    self.focus_secondary = false;
-                    self.settings.split_view = false;
-                    self.sync_watch();
+                    self.close_secondary_pane();
                 } else {
                     let loc = self.active().location.clone();
-                    self.secondary_tab = Some(Tab::new(loc, self.show_hidden, self.show_system));
+                    let mut sec = Tab::new(loc, self.show_hidden, self.show_system);
+                    apply_folder_view_to_tab(&self.settings, &mut sec);
+                    self.secondary_tab = Some(sec);
                     self.settings.split_view = true;
                 }
             }
@@ -73,7 +83,12 @@ impl LumenApp {
                 self.menu_anchor = None;
                 self.ctx_menu = None;
                 self.crumb_menu = None;
-                self.settings_open = !self.settings_open;
+                let opening = !self.settings_open;
+                self.settings_open = opening;
+                if opening {
+                    self.quick_look = None;
+                    self.dialog = None;
+                }
             }
             Command::NewWindow => {
                 let target = self.active().location.parsing_name();
@@ -81,7 +96,13 @@ impl LumenApp {
                     self.toast_error(format!("{err:#}"));
                 }
             }
-            Command::CloseTab => self.close_tab(self.active),
+            Command::CloseTab => {
+                if self.focus_secondary && self.secondary_tab.is_some() {
+                    self.close_secondary_pane();
+                } else {
+                    self.close_tab(self.active);
+                }
+            }
             Command::NextTab => self.activate_tab((self.active + 1) % self.tabs.len()),
             Command::PrevTab => self.activate_tab((self.active + self.tabs.len() - 1) % self.tabs.len()),
             Command::SelectAll => self.active_mut().select_all(),
@@ -110,14 +131,22 @@ impl LumenApp {
                 } else if let Some(index) = self.active().selection.iter().next().copied()
                     && let Some(entry) = self.active().entries.get(index)
                 {
+                    let Some(target_path) = entry.path.clone() else {
+                        self.toast_error("仅支持本地文件重命名");
+                        return;
+                    };
                     let name = entry.name.clone();
-                    self.rename = Some(RenameState { row: index, buf: name, focus: true, select_all: false });
+                    self.rename =
+                        Some(RenameState { row: index, target_path, buf: name, focus: true, select_all: false });
                 }
             }
             Command::NewFolder => {
                 if let Some(dir) = self.current_dir() {
-                    let name = unique_name(&dir, "新建文件夹", "");
-                    self.op_worker.submit(OpRequest::NewFolder { parent: dir, name });
+                    self.op_worker.submit(OpRequest::NewFolder {
+                        parent: dir,
+                        base_name: "新建文件夹".to_string(),
+                        target_tab_uid: Some(self.active().uid),
+                    });
                 } else {
                     self.toast_error("当前位置不支持新建文件夹");
                 }
@@ -126,9 +155,15 @@ impl LumenApp {
             Command::Open => self.open_selected(),
             Command::OpenNewTab => {
                 if let Some(location) = self.active().open_target() {
+                    self.save_active_search_snapshot();
+                    self.focus_secondary = false;
                     self.tabs.push(Tab::new(location, self.show_hidden, self.show_system));
                     self.active = self.tabs.len() - 1;
+                    self.rename = None;
+                    self.typed.buf.clear();
+                    self.restore_active_search_snapshot();
                     self.icons.bump_generation();
+                    self.apply_folder_view();
                     self.sync_watch();
                 }
             }
@@ -152,7 +187,7 @@ impl LumenApp {
                     && !paths.is_empty()
                 {
                     self.toast("正在后台压缩为 ZIP…");
-                    self.archive_rx = Some(crate::shell::archive::spawn_compress_zip(paths, dir));
+                    self.archive_rxs.push((dir.clone(), crate::shell::archive::spawn_compress_zip(paths, dir)));
                 }
             }
             Command::ExtractHere | Command::ExtractSubfolder => {
@@ -161,7 +196,7 @@ impl LumenApp {
                 {
                     let into_sub = command == Command::ExtractSubfolder;
                     self.toast("正在后台解压…");
-                    self.archive_rx = Some(crate::shell::archive::spawn_extract(archive, dir, into_sub));
+                    self.archive_rxs.push((dir.clone(), crate::shell::archive::spawn_extract(archive, dir, into_sub)));
                 }
             }
             Command::CreateShortcut => {
@@ -246,11 +281,11 @@ impl LumenApp {
             }
             Command::ToggleHidden => {
                 self.show_hidden = !self.show_hidden;
-                self.reload_active();
+                self.reload_visible_panes();
             }
             Command::ToggleSystemFiles => {
                 self.show_system = !self.show_system;
-                self.reload_active();
+                self.reload_visible_panes();
             }
             Command::ImportExplorerTabs => {
                 let folders = crate::shell::integrate::list_open_explorer_folders();
@@ -269,8 +304,12 @@ impl LumenApp {
                     }
                 }
                 if added > 0 {
+                    self.save_active_search_snapshot();
                     self.focus_secondary = false;
                     self.active = self.tabs.len() - 1;
+                    self.rename = None;
+                    self.typed.buf.clear();
+                    self.restore_active_search_snapshot();
                     self.icons.bump_generation();
                     self.apply_folder_view();
                     self.sync_watch();
@@ -302,12 +341,12 @@ impl LumenApp {
             }
             Command::ToggleWinE => {
                 let next = !self.settings.intercept_win_e;
-                if next && !self.settings.tray_resident {
-                    self.settings.tray_resident = true;
-                    platform::set_tray_enabled(true);
-                }
                 if platform::set_global_hotkey(next) {
                     self.settings.intercept_win_e = next;
+                    if next && !self.settings.tray_resident {
+                        self.settings.tray_resident = true;
+                        platform::set_tray_enabled(true);
+                    }
                     self.toast(if next {
                         "已开启全局呼出快捷键 Ctrl+Alt+E"
                     } else {
@@ -354,10 +393,12 @@ impl LumenApp {
                 tab.group_by = key;
                 tab.rebuild_display();
                 tab.scroll_offset = 0.0;
+                self.reconcile_rename_row();
                 self.record_folder_view();
             }
             Command::SortBy(key) => {
                 self.active_mut().set_sort(key);
+                self.reconcile_rename_row();
                 self.record_folder_view();
             }
             Command::CycleTheme => self.theme_cycle_requested = true,
@@ -397,13 +438,42 @@ impl LumenApp {
         if index == self.active && !self.focus_secondary {
             return;
         }
+        self.save_active_search_snapshot();
         self.focus_secondary = false;
         self.active = index;
         self.address.editing = false;
+        self.address_suggest_rect = None;
+        self.address_cursor_end = false;
         self.rename = None;
-        self.stop_search();
+        self.typed.buf.clear();
+        self.restore_active_search_snapshot();
         self.icons.bump_generation();
         self.apply_folder_view();
+        self.sync_watch();
+    }
+
+    /// Closes the split-view secondary pane and restores focus & search state to the primary tab.
+    pub(crate) fn close_secondary_pane(&mut self) {
+        let Some(removed) = self.secondary_tab.take() else {
+            self.focus_secondary = false;
+            self.settings.split_view = false;
+            return;
+        };
+        if !self.focus_secondary {
+            self.save_active_search_snapshot();
+        }
+        self.pending_spring_clear_tabs.push(removed.uid);
+        self.tab_search.remove(&removed.uid);
+        if self.search_owner_uid == Some(removed.uid) {
+            self.search.engine.cancel();
+            self.search_owner_uid = None;
+            self.search.running = false;
+        }
+        self.focus_secondary = false;
+        self.settings.split_view = false;
+        self.rename = None;
+        self.typed.buf.clear();
+        self.restore_active_search_snapshot();
         self.sync_watch();
     }
 
@@ -412,7 +482,18 @@ impl LumenApp {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return;
         }
+        let closing_uid = self.tabs[index].uid;
+        if self.last_focused_tab_uid != closing_uid {
+            self.save_active_search_snapshot();
+        }
         let removed = self.tabs.remove(index);
+        self.pending_spring_clear_tabs.push(removed.uid);
+        self.tab_search.remove(&removed.uid);
+        if self.search_owner_uid == Some(removed.uid) {
+            self.search.engine.cancel();
+            self.search_owner_uid = None;
+            self.search.running = false;
+        }
         self.closed_tabs.push(removed.location.parsing_name());
         if self.closed_tabs.len() > 20 {
             self.closed_tabs.remove(0);
@@ -421,7 +502,10 @@ impl LumenApp {
             self.active -= 1;
         }
         self.active = self.active.min(self.tabs.len() - 1);
+        self.focus_secondary = false;
         self.rename = None;
+        self.typed.buf.clear();
+        self.restore_active_search_snapshot();
         self.apply_folder_view();
         self.sync_watch();
     }
@@ -491,7 +575,12 @@ impl LumenApp {
             return;
         };
         if cut {
-            self.op_worker.submit(OpRequest::Move { items: paths, dest_dir: dir, clear_clipboard: true });
+            self.op_worker.submit(OpRequest::Move {
+                items: paths,
+                dest_dir: dir,
+                clear_clipboard: true,
+                origin: OpOrigin::Normal,
+            });
         } else {
             self.op_worker.submit(OpRequest::Copy { items: paths, dest_dir: dir });
         }
@@ -532,13 +621,20 @@ impl LumenApp {
         self.active().is_search()
     }
 
-    /// Cancels the running engine without touching the view (navigation does this).
+    /// Cancels the active tab's search without touching the view (navigation does this).
     pub(crate) fn stop_search(&mut self) {
-        self.search.engine.cancel();
+        let current_uid = self.active().uid;
+        if self.search_owner_uid == Some(current_uid) {
+            self.search.engine.cancel();
+            self.search_owner_uid = None;
+        }
         self.search.running = false;
         self.search.root = None;
         self.search.query.clear();
         self.search.last_query.clear();
+        self.search.typed_text.clear();
+        self.search.typed_at = 0.0;
+        self.tab_search.remove(&current_uid);
     }
 
     /// Leaves search mode and shows the folder again.
@@ -558,28 +654,48 @@ impl LumenApp {
             self.cancel_search();
             return;
         }
+        let current_uid = self.active().uid;
+        if let Some(prev_uid) = self.search_owner_uid.take()
+            && prev_uid != current_uid
+        {
+            self.search.engine.cancel();
+            if let Some(prev_tab) = self.tab_by_uid_mut(prev_uid) {
+                prev_tab.finish_search();
+            }
+        }
         self.active_mut().set_search_results(Vec::new(), query.clone());
         self.search.root = Some(root.clone());
         self.search.running = true;
         self.search.last_query = query.clone();
+        self.search.typed_text = self.search.query.clone();
+        self.search_owner_uid = Some(current_uid);
+        self.last_focused_tab_uid = current_uid;
+        self.save_active_search_snapshot();
         self.search.engine.start_with_backend(&root, &query, self.show_hidden, self.settings.search_backend);
     }
 
     pub(crate) fn finish_search(&mut self) {
-        if !self.search.running {
+        let Some(owner_uid) = self.search_owner_uid.take() else {
+            self.search.running = false;
             return;
-        }
+        };
         self.search.running = false;
-        self.active_mut().finish_search();
+        if let Some(tab) = self.tab_by_uid_mut(owner_uid) {
+            tab.finish_search();
+        }
     }
 
     // ---- undo ------------------------------------------------------------
 
-    pub(crate) fn push_undo(&mut self, entry: UndoEntry) {
+    pub(crate) fn push_undo_keep_redo(&mut self, entry: UndoEntry) {
         if self.undo_stack.len() >= 64 {
             self.undo_stack.remove(0);
         }
         self.undo_stack.push(entry);
+    }
+
+    pub(crate) fn push_undo(&mut self, entry: UndoEntry) {
+        self.push_undo_keep_redo(entry);
         self.redo_stack.clear();
     }
 
@@ -594,7 +710,12 @@ impl LumenApp {
                     return;
                 };
                 self.redo_stack.push(UndoEntry::Rename { from: to.clone(), to: from });
-                self.op_worker.submit(OpRequest::Rename { from: to, new_name: name, is_undo: true });
+                self.op_worker.submit(OpRequest::Rename {
+                    from: to,
+                    new_name: name,
+                    origin: OpOrigin::Undo,
+                    target_tab_uid: Some(self.active().uid),
+                });
             }
             UndoEntry::Created { paths } | UndoEntry::Copied { paths } => {
                 self.op_worker.submit(OpRequest::DeleteDirect { items: paths });
@@ -615,13 +736,19 @@ impl LumenApp {
                     self.redo_stack.push(UndoEntry::Moved { pairs: redo_pairs });
                 }
                 for (dest_dir, items) in by_parent {
-                    self.op_worker.submit(OpRequest::Move { items, dest_dir, clear_clipboard: false });
+                    self.op_worker.submit(OpRequest::Move {
+                        items,
+                        dest_dir,
+                        clear_clipboard: false,
+                        origin: OpOrigin::Undo,
+                    });
                 }
             }
             UndoEntry::Deleted { items } => match crate::shell::ops::restore_from_recycle_bin(&items) {
                 Ok(count) => {
+                    let dirs: Vec<PathBuf> = items.iter().filter_map(|p| p.parent().map(PathBuf::from)).collect();
                     self.toast(format!("已从回收站还原 {count} 个项目"));
-                    self.reload_active();
+                    self.refresh_affected_panes(&dirs, true);
                 }
                 Err(err) => self.toast_error(format!("{err:#}")),
             },
@@ -638,7 +765,12 @@ impl LumenApp {
                 let Some(name) = from.file_name().map(|n| n.to_string_lossy().to_string()) else {
                     return;
                 };
-                self.op_worker.submit(OpRequest::Rename { from: to, new_name: name, is_undo: false });
+                self.op_worker.submit(OpRequest::Rename {
+                    from: to,
+                    new_name: name,
+                    origin: OpOrigin::Redo,
+                    target_tab_uid: Some(self.active().uid),
+                });
             }
             UndoEntry::Moved { pairs } => {
                 let mut by_parent: std::collections::HashMap<PathBuf, Vec<PathBuf>> = std::collections::HashMap::new();
@@ -651,7 +783,12 @@ impl LumenApp {
                     }
                 }
                 for (dest_dir, items) in by_parent {
-                    self.op_worker.submit(OpRequest::Move { items, dest_dir, clear_clipboard: false });
+                    self.op_worker.submit(OpRequest::Move {
+                        items,
+                        dest_dir,
+                        clear_clipboard: false,
+                        origin: OpOrigin::Redo,
+                    });
                 }
             }
             _ => {}
@@ -713,22 +850,46 @@ impl LumenApp {
     }
 
     pub(crate) fn finish_rename(&mut self) {
+        self.finish_rename_with_flush(true);
+    }
+
+    pub(crate) fn finish_rename_with_flush(&mut self, flush_pending: bool) {
         let Some(rename) = self.rename.take() else { return };
         if self.active().is_recycle_bin() {
+            if flush_pending {
+                self.flush_pending_refresh();
+            }
             return;
         }
-        let Some(entry) = self.active().entries.get(rename.row).cloned() else {
+        // Resolve the target file by its captured path (never volatile row index!) so an
+        // intervening re-sort or refresh can never rename a different file.
+        let target_path = rename.target_path;
+        let orig_name = self
+            .active()
+            .entries
+            .iter()
+            .find(|e| e.path.as_deref().is_some_and(|p| p.as_os_str().eq_ignore_ascii_case(target_path.as_os_str())))
+            .map(|e| e.name.clone())
+            .or_else(|| target_path.file_name().map(|n| n.to_string_lossy().to_string()));
+        let Some(orig_name) = orig_name else {
+            if flush_pending {
+                self.flush_pending_refresh();
+            }
             return;
         };
         let new_name = rename.buf.trim().to_string();
-        if new_name.is_empty() || new_name == entry.name {
+        if new_name.is_empty() || new_name == orig_name {
+            if flush_pending {
+                self.flush_pending_refresh();
+            }
             return;
         }
-        let Some(path) = entry.path.clone() else {
-            self.toast_error("仅支持本地文件重命名");
-            return;
-        };
-        self.op_worker.submit(OpRequest::Rename { from: path, new_name, is_undo: false });
+        self.op_worker.submit(OpRequest::Rename {
+            from: target_path,
+            new_name,
+            origin: OpOrigin::Normal,
+            target_tab_uid: Some(self.active().uid),
+        });
     }
 
     pub(crate) fn confirm_dialog(&mut self) {
@@ -739,6 +900,7 @@ impl LumenApp {
                 if paths.is_empty() {
                     return;
                 }
+                let target_tab_uid = Some(self.active().uid);
                 for path in paths {
                     let Some(orig) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
                         continue;
@@ -747,7 +909,12 @@ impl LumenApp {
                     if new_name.is_empty() || new_name == orig {
                         continue;
                     }
-                    self.op_worker.submit(OpRequest::Rename { from: path, new_name, is_undo: false });
+                    self.op_worker.submit(OpRequest::Rename {
+                        from: path,
+                        new_name,
+                        origin: OpOrigin::Normal,
+                        target_tab_uid,
+                    });
                 }
             }
         }
