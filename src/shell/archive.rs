@@ -65,25 +65,54 @@ fn compress_zip_sync(items: &[PathBuf], dest_dir: &Path) -> ArchiveOutcome {
     let zip_name = crate::app::unique_name(dest_dir, &base, "zip");
     let zip_path = dest_dir.join(&zip_name);
 
-    let mut cmd = std::process::Command::new("tar.exe");
-    cmd.args(["-a", "-c", "-f"]).arg(&zip_path).arg("-C").arg(dest_dir);
-    let mut added = 0usize;
+    // Group items by parent directory so cross-folder selections (e.g. search results)
+    // archive cleanly via `-C <parent>` rather than assuming direct children of `dest_dir`.
+    let mut groups: Vec<(PathBuf, Vec<std::ffi::OsString>)> = Vec::new();
     for item in items {
-        if let Some(name) = item.file_name() {
-            cmd.arg(name);
-            added += 1;
+        let Some(name) = item.file_name() else { continue };
+        let parent = item.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(dest_dir);
+        if let Some((_, list)) =
+            groups.iter_mut().find(|(dir, _)| dir.as_os_str().eq_ignore_ascii_case(parent.as_os_str()))
+        {
+            list.push(name.to_os_string());
+        } else {
+            groups.push((parent.to_path_buf(), vec![name.to_os_string()]));
         }
     }
-    if added == 0 {
+    if groups.is_empty() {
         return ArchiveOutcome {
             message: String::new(), select_name: None, error: Some("无法解析压缩路径".into())
         };
+    }
+
+    let mut cmd = std::process::Command::new("tar.exe");
+    cmd.args(["-a", "-c", "-f"]).arg(&zip_path);
+    let multi_dir = groups.len() > 1;
+    for (idx, (parent, names)) in groups.iter().enumerate() {
+        cmd.arg("-C").arg(parent);
+        if idx == 0 {
+            // End option parsing before filenames so names beginning with `-` cannot inject flags.
+            cmd.arg("--");
+        }
+        for name in names {
+            let text = name.to_string_lossy();
+            // bsdtar treats leading `@` as archive-inclusion even after `--`, and still recognizes
+            // `-C` between positional args; prefixing `./` neutralizes both cleanly.
+            if text.starts_with('@') || (multi_dir && text.starts_with('-')) || text == "-C" {
+                let mut safe = std::ffi::OsString::from("./");
+                safe.push(name);
+                cmd.arg(safe);
+            } else {
+                cmd.arg(name);
+            }
+        }
     }
     match cmd.creation_flags(CREATE_NO_WINDOW.0).output() {
         Ok(out) if out.status.success() => {
             ArchiveOutcome { message: format!("已压缩为 {zip_name}"), select_name: Some(zip_name), error: None }
         }
         Ok(out) => {
+            let _ = std::fs::remove_file(&zip_path);
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             ArchiveOutcome {
                 message: String::new(),
@@ -92,6 +121,7 @@ fn compress_zip_sync(items: &[PathBuf], dest_dir: &Path) -> ArchiveOutcome {
             }
         }
         Err(err) => {
+            let _ = std::fs::remove_file(&zip_path);
             ArchiveOutcome { message: String::new(), select_name: None, error: Some(format!("压缩失败: {err}")) }
         }
     }
@@ -103,7 +133,7 @@ fn extract_sync(archive: &Path, dest_dir: &Path, into_subfolder: bool) -> Archiv
         .map(|s| s.to_string_lossy().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "已解压".to_string());
-    let (target_dir, select_name) = if into_subfolder {
+    let (target_dir, select_name, created_dir) = if into_subfolder {
         let folder_name = crate::app::unique_name(dest_dir, &stem, "");
         let target = dest_dir.join(&folder_name);
         if let Err(err) = std::fs::create_dir_all(&target) {
@@ -113,9 +143,17 @@ fn extract_sync(archive: &Path, dest_dir: &Path, into_subfolder: bool) -> Archiv
                 error: Some(format!("创建解压目录失败: {err}")),
             };
         }
-        (target, Some(folder_name))
+        (target, Some(folder_name), true)
     } else {
-        (dest_dir.to_path_buf(), None)
+        let existed = dest_dir.exists();
+        if !existed && let Err(err) = std::fs::create_dir_all(dest_dir) {
+            return ArchiveOutcome {
+                message: String::new(),
+                select_name: None,
+                error: Some(format!("创建解压目录失败: {err}")),
+            };
+        }
+        (dest_dir.to_path_buf(), None, !existed)
     };
 
     let output = std::process::Command::new("tar.exe")
@@ -132,6 +170,9 @@ fn extract_sync(archive: &Path, dest_dir: &Path, into_subfolder: bool) -> Archiv
             error: None,
         },
         Ok(out) => {
+            if created_dir {
+                let _ = std::fs::remove_dir(&target_dir);
+            }
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             ArchiveOutcome {
                 message: String::new(),
@@ -144,6 +185,9 @@ fn extract_sync(archive: &Path, dest_dir: &Path, into_subfolder: bool) -> Archiv
             }
         }
         Err(err) => {
+            if created_dir {
+                let _ = std::fs::remove_dir(&target_dir);
+            }
             ArchiveOutcome { message: String::new(), select_name: None, error: Some(format!("解压失败: {err}")) }
         }
     }
@@ -168,5 +212,66 @@ mod tests {
         let outcome = compress_zip_sync(&[], Path::new("."));
         assert!(outcome.error.is_some());
         assert!(outcome.select_name.is_none());
+    }
+
+    #[test]
+    fn compress_handles_cross_directory_and_special_leading_chars() {
+        let root = std::env::temp_dir().join(format!("lumen-archive-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir_a = root.join("dir_a");
+        let dir_b = root.join("dir_b");
+        let out_dir = root.join("out");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let f_dash = dir_a.join("-dash.txt");
+        let f_at = dir_a.join("@at.txt");
+        let f_plain = dir_a.join("plain.txt");
+        let f_sib = dir_b.join("sibling.txt");
+        let f_sib_dash = dir_b.join("-other.txt");
+        std::fs::write(&f_dash, b"dash-body").unwrap();
+        std::fs::write(&f_at, b"at-body").unwrap();
+        std::fs::write(&f_plain, b"plain-body").unwrap();
+        std::fs::write(&f_sib, b"sib-body").unwrap();
+        std::fs::write(&f_sib_dash, b"other-body").unwrap();
+
+        let items = vec![f_dash, f_at, f_plain, f_sib, f_sib_dash];
+        let outcome = compress_zip_sync(&items, &out_dir);
+        assert!(outcome.error.is_none(), "compress failed: {:?}", outcome.error);
+        let zip_name = outcome.select_name.expect("zip name");
+        let zip_path = out_dir.join(&zip_name);
+        assert!(zip_path.is_file());
+
+        let extracted = extract_sync(&zip_path, &out_dir, true);
+        assert!(extracted.error.is_none(), "extract failed: {:?}", extracted.error);
+        let sub = out_dir.join(extracted.select_name.expect("subfolder name"));
+        assert_eq!(std::fs::read(sub.join("-dash.txt")).unwrap(), b"dash-body");
+        assert_eq!(std::fs::read(sub.join("@at.txt")).unwrap(), b"at-body");
+        assert_eq!(std::fs::read(sub.join("plain.txt")).unwrap(), b"plain-body");
+        assert_eq!(std::fs::read(sub.join("sibling.txt")).unwrap(), b"sib-body");
+        assert_eq!(std::fs::read(sub.join("-other.txt")).unwrap(), b"other-body");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_extract_cleans_up_newly_created_empty_dir() {
+        let root = std::env::temp_dir().join(format!("lumen-archive-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let bad = root.join("corrupt.zip");
+        std::fs::write(&bad, b"definitely-not-a-valid-zip").unwrap();
+
+        let sub_out = extract_sync(&bad, &root, true);
+        assert!(sub_out.error.is_some());
+        assert!(!root.join("corrupt").exists(), "failed subfolder extract must not leave empty dir");
+
+        let fresh_dest = root.join("fresh_target");
+        let flat_out = extract_sync(&bad, &fresh_dest, false);
+        assert!(flat_out.error.is_some());
+        assert!(!fresh_dest.exists(), "failed extract into newly created dest_dir must remove empty dir");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

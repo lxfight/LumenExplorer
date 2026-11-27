@@ -190,10 +190,9 @@ fn watch_loop(rx: Receiver<Command>, stop: Event, wake: Event, dirty: Arc<Atomic
                 // Folder gone, volume removed or handle revoked: just stop listening.
                 cancel(target.take());
             }
-            continue;
         }
 
-        // Timeout: report the coalesced burst once it has been quiet long enough.
+        // Report the coalesced burst once it has been quiet long enough or hit MAX_LATENCY.
         if let Some(burst) = &pending
             && Instant::now() >= burst.until
         {
@@ -371,5 +370,29 @@ mod tests {
         let mut watcher = Watcher::new();
         watcher.watch(None);
         assert!(!dirty_within(&mut watcher, Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn watch_flushes_at_max_latency_during_continuous_burst() {
+        let dir = TempDir::new("burst");
+        let mut watcher = Watcher::new();
+        watcher.watch(Some(dir.0.clone()));
+        std::thread::sleep(SETTLE);
+        let _ = watcher.poll();
+
+        // Write continuously every 35ms (shorter than QUIET = 120ms) so the burst
+        // never goes quiet; MAX_LATENCY (500ms) must still flush within 1.5s.
+        let started = Instant::now();
+        let mut flushed = false;
+        for idx in 0..40 {
+            std::fs::write(dir.file("stream.log"), format!("tick-{idx}")).unwrap();
+            if watcher.poll() {
+                flushed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(35));
+        }
+        assert!(flushed, "continuous burst failed to flush within {:?}", started.elapsed());
+        assert!(started.elapsed() < Duration::from_millis(1400));
     }
 }
