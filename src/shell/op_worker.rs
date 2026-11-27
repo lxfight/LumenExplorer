@@ -25,6 +25,13 @@ use windows::core::{GUID, HRESULT, HSTRING, IUnknown, IUnknown_Vtbl, Interface, 
 
 use crate::shell::location::{Pidl, is_in_recycle_bin_path, item_path};
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpOrigin {
+    Normal,
+    Undo,
+    Redo,
+}
+
 #[derive(Clone, Debug)]
 pub enum OpRequest {
     Copy {
@@ -35,6 +42,7 @@ pub enum OpRequest {
         items: Vec<PathBuf>,
         dest_dir: PathBuf,
         clear_clipboard: bool,
+        origin: OpOrigin,
     },
     Delete {
         items: Vec<PathBuf>,
@@ -52,11 +60,13 @@ pub enum OpRequest {
     Rename {
         from: PathBuf,
         new_name: String,
-        is_undo: bool,
+        origin: OpOrigin,
+        target_tab_uid: Option<u64>,
     },
     NewFolder {
         parent: PathBuf,
-        name: String,
+        base_name: String,
+        target_tab_uid: Option<u64>,
     },
     CreateShortcut {
         items: Vec<PathBuf>,
@@ -74,11 +84,11 @@ pub struct OpProgress {
 #[derive(Clone, Debug)]
 pub enum OpResult {
     Copied { pairs: Vec<(PathBuf, PathBuf)> },
-    Moved { pairs: Vec<(PathBuf, PathBuf)>, clear_clipboard: bool },
+    Moved { pairs: Vec<(PathBuf, PathBuf)>, clear_clipboard: bool, origin: OpOrigin },
     Deleted { items: Vec<PathBuf>, permanent: bool, count: usize },
-    DeletedDirect { count: usize },
-    Renamed { from: PathBuf, to: PathBuf, is_undo: bool },
-    CreatedFolder { path: PathBuf, name: String },
+    DeletedDirect { items: Vec<PathBuf>, count: usize },
+    Renamed { from: PathBuf, to: PathBuf, origin: OpOrigin, target_tab_uid: Option<u64> },
+    CreatedFolder { path: PathBuf, name: String, target_tab_uid: Option<u64> },
     CreatedShortcuts { paths: Vec<PathBuf> },
 }
 
@@ -169,7 +179,11 @@ fn worker_loop(
 fn req_label(req: &OpRequest) -> String {
     match req {
         OpRequest::Copy { items, .. } => format!("正在复制 {} 个项目…", items.len()),
-        OpRequest::Move { items, .. } => format!("正在移动 {} 个项目…", items.len()),
+        OpRequest::Move { items, origin, .. } => match origin {
+            OpOrigin::Undo => format!("正在撤销移动 {} 个项目…", items.len()),
+            OpOrigin::Redo => format!("正在重做移动 {} 个项目…", items.len()),
+            OpOrigin::Normal => format!("正在移动 {} 个项目…", items.len()),
+        },
         OpRequest::Delete { items, permanent } => {
             if *permanent {
                 format!("正在永久删除 {} 个项目…", items.len())
@@ -180,7 +194,7 @@ fn req_label(req: &OpRequest) -> String {
         OpRequest::DeletePidls { pidl_bytes } => format!("正在永久删除 {} 个项目…", pidl_bytes.len()),
         OpRequest::DeleteDirect { items } => format!("正在撤销 {} 个项目…", items.len()),
         OpRequest::Rename { new_name, .. } => format!("正在重命名为 {new_name}…"),
-        OpRequest::NewFolder { name, .. } => format!("正在新建 {name}…"),
+        OpRequest::NewFolder { base_name, .. } => format!("正在新建 {base_name}…"),
         OpRequest::CreateShortcut { items, .. } => format!("正在创建 {} 个快捷方式…", items.len()),
     }
 }
@@ -461,11 +475,11 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             }
             let res = unsafe { op.PerformOperations() };
             let _ = unsafe { op.Unadvise(cookie) };
-            res?;
+            finish_allow_cancel(res)?;
             let pairs = data.landed_pairs.lock().unwrap().clone();
             Ok(OpResult::Copied { pairs })
         }
-        OpRequest::Move { items, dest_dir, clear_clipboard } => {
+        OpRequest::Move { items, dest_dir, clear_clipboard, origin } => {
             let (op, cookie) = create_op(FOF_ALLOWUNDO, &sink)?;
             let dest = shell_item(&dest_dir)?;
             for item in &items {
@@ -474,9 +488,9 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             }
             let res = unsafe { op.PerformOperations() };
             let _ = unsafe { op.Unadvise(cookie) };
-            res?;
+            finish_allow_cancel(res)?;
             let pairs = data.landed_pairs.lock().unwrap().clone();
-            Ok(OpResult::Moved { pairs, clear_clipboard })
+            Ok(OpResult::Moved { pairs, clear_clipboard, origin })
         }
         OpRequest::Delete { items, permanent } => {
             // Never attempt to recycle items already inside a physical `$Recycle.Bin` folder.
@@ -533,10 +547,11 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
             let res = unsafe { op.PerformOperations() };
             let _ = unsafe { op.Unadvise(cookie) };
             res?;
-            let count = data.deleted.lock().unwrap().len();
-            Ok(OpResult::DeletedDirect { count })
+            let deleted = data.deleted.lock().unwrap().clone();
+            let count = deleted.len();
+            Ok(OpResult::DeletedDirect { items: deleted, count })
         }
-        OpRequest::Rename { from, new_name, is_undo } => {
+        OpRequest::Rename { from, new_name, origin, target_tab_uid } => {
             crate::shell::ops::validate_name(&new_name)?;
             let (op, cookie) = create_op(FILEOPERATION_FLAGS(0), &sink)?;
             let shell = shell_item(&from)?;
@@ -552,9 +567,10 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
                 .first()
                 .map(|(_, to)| to.clone())
                 .unwrap_or_else(|| from.parent().map(|p| p.join(&new_name)).unwrap_or_else(|| from.clone()));
-            Ok(OpResult::Renamed { from, to, is_undo })
+            Ok(OpResult::Renamed { from, to, origin, target_tab_uid })
         }
-        OpRequest::NewFolder { parent, name } => {
+        OpRequest::NewFolder { parent, base_name, target_tab_uid } => {
+            let name = crate::app::unique_name(&parent, &base_name, "");
             crate::shell::ops::validate_name(&name)?;
             let (op, cookie) = create_op(FILEOPERATION_FLAGS(0), &sink)?;
             let dir = shell_item(&parent)?;
@@ -572,7 +588,8 @@ fn run_request(req: OpRequest, progress: &Arc<Mutex<OpProgress>>) -> anyhow::Res
                 .first()
                 .map(|(_, to)| to.clone())
                 .unwrap_or_else(|| parent.join(&name));
-            Ok(OpResult::CreatedFolder { path: created, name })
+            let actual_name = created.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(name);
+            Ok(OpResult::CreatedFolder { path: created, name: actual_name, target_tab_uid })
         }
         OpRequest::CreateShortcut { items, dest_dir } => {
             let mut paths = Vec::new();
@@ -596,5 +613,38 @@ mod tests {
         assert!(finish_allow_cancel(Err(win32_cancel)).is_ok());
         let access_denied = windows::core::Error::from_hresult(HRESULT(0x8007_0005u32 as i32));
         assert!(finish_allow_cancel(Err(access_denied)).is_err());
+    }
+
+    #[test]
+    fn rapid_new_folder_requests_deduplicate_sequentially_in_worker() {
+        let root = std::env::temp_dir().join(format!("lumen-op-newfolder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let worker = OpWorker::new();
+        for _ in 0..3 {
+            worker.submit(OpRequest::NewFolder {
+                parent: root.clone(),
+                base_name: "新建文件夹".to_string(),
+                target_tab_uid: Some(42),
+            });
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut created = Vec::new();
+        while created.len() < 3 && std::time::Instant::now() < deadline {
+            for item in worker.poll() {
+                let Ok(OpResult::CreatedFolder { name, target_tab_uid, .. }) = item.result else {
+                    panic!("unexpected op result: {:?}", item.result);
+                };
+                assert_eq!(target_tab_uid, Some(42));
+                created.push(name);
+            }
+            if created.len() < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert_eq!(created, vec!["新建文件夹", "新建文件夹 (2)", "新建文件夹 (3)"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

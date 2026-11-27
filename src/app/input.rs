@@ -1,4 +1,4 @@
-﻿//! Keyboard shortcuts, type-ahead jump, address bar editing, and inline rename keys.
+//! Keyboard shortcuts, type-ahead jump, address bar editing, and inline rename keys.
 
 use crate::core::ViewMode;
 use crate::platform;
@@ -26,8 +26,13 @@ impl LumenApp {
             }
             return;
         }
-        if self.settings_open
-            || self.quick_look.is_some()
+        if self.settings_open {
+            if input.modifiers.ctrl && !input.modifiers.shift && !input.modifiers.alt && input.key_pressed(Key::Comma) {
+                self.settings_open = false;
+            }
+            return;
+        }
+        if self.quick_look.is_some()
             || self.crumb_menu.is_some()
             || self.menu_anchor.is_some()
             || self.ctx_menu.is_some()
@@ -56,7 +61,12 @@ impl LumenApp {
         let editing_text = self.search_focused;
 
         if input.key_pressed(Key::Escape) {
-            if self.search_active() || !self.search.query.is_empty() {
+            if self.sidebar_focused {
+                self.sidebar_focused = false;
+                if let Some(focused) = ctx.memory(|m| m.focused()) {
+                    ctx.memory_mut(|m| m.surrender_focus(focused));
+                }
+            } else if self.search_active() || !self.search.query.is_empty() {
                 self.cancel_search();
             } else if !self.active().selection.is_empty() {
                 self.active_mut().clear_selection();
@@ -105,6 +115,9 @@ impl LumenApp {
         if editing_text || self.sidebar_focused {
             return;
         }
+        if !self.typed.buf.is_empty() && now() - self.typed.at > 0.9 {
+            self.typed.buf.clear();
+        }
         self.handle_list_keys(&input, ctrl, shift, alt, handled_copy, handled_cut, handled_paste);
         if self.quick_look.is_none() {
             self.handle_type_ahead(&input);
@@ -113,48 +126,53 @@ impl LumenApp {
 
     fn handle_global_key(&mut self, key: egui::Key, ctrl: bool, shift: bool, alt: bool, ctx: &egui::Context) -> bool {
         use egui::Key;
+        let plain = !ctrl && !shift && !alt;
+        let ctrl_only = ctrl && !shift && !alt;
+        let ctrl_shift = ctrl && shift && !alt;
+        let alt_only = alt && !ctrl && !shift;
+        let shift_only = shift && !ctrl && !alt;
         match key {
-            Key::F5 => self.command(Command::Refresh),
-            Key::F3 => self.command(Command::FocusSearch),
-            Key::F if ctrl => self.command(Command::FocusSearch),
-            Key::E if ctrl && shift => self.command(Command::ToggleSplitView),
-            Key::E if ctrl => self.command(Command::FocusSearch),
-            Key::Comma if ctrl => self.command(Command::OpenSettings),
-            Key::L if ctrl => self.command(Command::FocusAddress),
-            Key::D if alt => self.command(Command::FocusAddress),
-            Key::F4 if !alt => self.command(Command::FocusAddress),
-            Key::T if ctrl && shift => self.command(Command::ReopenClosedTab),
-            Key::T if ctrl => self.command(Command::NewTab),
-            Key::Num1 if ctrl => self.activate_tab(0),
-            Key::Num2 if ctrl => self.activate_tab(1),
-            Key::Num3 if ctrl => self.activate_tab(2),
-            Key::Num4 if ctrl => self.activate_tab(3),
-            Key::Num5 if ctrl => self.activate_tab(4),
-            Key::Num6 if ctrl => self.activate_tab(5),
-            Key::Num7 if ctrl => self.activate_tab(6),
-            Key::Num8 if ctrl => self.activate_tab(7),
-            Key::Num9 if ctrl && !self.tabs.is_empty() => self.activate_tab(self.tabs.len() - 1),
-            Key::N if ctrl && !shift => self.command(Command::NewWindow),
-            Key::W if ctrl => self.command(Command::CloseTab),
-            Key::Tab if ctrl && shift => self.command(Command::PrevTab),
-            Key::Tab if ctrl => self.command(Command::NextTab),
-            Key::N if ctrl && shift => self.command(Command::NewFolder),
-            Key::H if ctrl => self.command(Command::ToggleHidden),
-            Key::D if ctrl && shift => self.cycle_theme(ctx),
-            Key::I if ctrl && shift => self.command(Command::InvertSelection),
-            Key::Z if ctrl && shift => self.command(Command::Redo),
-            Key::Y if ctrl => self.command(Command::Redo),
-            Key::Z if ctrl => self.command(Command::Undo),
-            Key::A if ctrl => self.command(Command::SelectAll),
-            Key::C if ctrl && shift => self.command(Command::CopyPath),
-            Key::O if ctrl && shift => self.command(Command::ImportExplorerTabs),
-            Key::G if ctrl && shift => self.command(Command::JumpClipboardPath),
-            Key::Enter if alt => self.command(Command::Properties),
-            Key::I if alt => self.command(Command::Properties),
-            Key::F10 if shift => self.command(Command::ShowContextMenu),
-            Key::ArrowLeft if alt => self.command(Command::Back),
-            Key::ArrowRight if alt => self.command(Command::Forward),
-            Key::ArrowUp if alt => self.command(Command::Up),
+            Key::F5 if plain || ctrl_only => self.command(Command::Refresh),
+            Key::F3 if plain => self.command(Command::FocusSearch),
+            Key::F if ctrl_only => self.command(Command::FocusSearch),
+            Key::E if ctrl_shift => self.command(Command::ToggleSplitView),
+            Key::E if ctrl_only => self.command(Command::FocusSearch),
+            Key::Comma if ctrl_only => self.command(Command::OpenSettings),
+            Key::L if ctrl_only => self.command(Command::FocusAddress),
+            Key::D if alt_only => self.command(Command::FocusAddress),
+            Key::F4 if plain => self.command(Command::FocusAddress),
+            Key::T if ctrl_shift => self.command(Command::ReopenClosedTab),
+            Key::T if ctrl_only => self.command(Command::NewTab),
+            Key::Num1 if ctrl_only => self.activate_tab(0),
+            Key::Num2 if ctrl_only => self.activate_tab(1),
+            Key::Num3 if ctrl_only => self.activate_tab(2),
+            Key::Num4 if ctrl_only => self.activate_tab(3),
+            Key::Num5 if ctrl_only => self.activate_tab(4),
+            Key::Num6 if ctrl_only => self.activate_tab(5),
+            Key::Num7 if ctrl_only => self.activate_tab(6),
+            Key::Num8 if ctrl_only => self.activate_tab(7),
+            Key::Num9 if ctrl_only && !self.tabs.is_empty() => self.activate_tab(self.tabs.len() - 1),
+            Key::N if ctrl_only => self.command(Command::NewWindow),
+            Key::W if ctrl_only => self.command(Command::CloseTab),
+            Key::Tab if ctrl_shift => self.command(Command::PrevTab),
+            Key::Tab if ctrl_only => self.command(Command::NextTab),
+            Key::N if ctrl_shift => self.command(Command::NewFolder),
+            Key::H if ctrl_only => self.command(Command::ToggleHidden),
+            Key::D if ctrl_shift => self.cycle_theme(ctx),
+            Key::I if ctrl_shift => self.command(Command::InvertSelection),
+            Key::Z if ctrl_shift => self.command(Command::Redo),
+            Key::Y if ctrl_only => self.command(Command::Redo),
+            Key::Z if ctrl_only => self.command(Command::Undo),
+            Key::A if ctrl_only => self.command(Command::SelectAll),
+            Key::C if ctrl_shift => self.command(Command::CopyPath),
+            Key::O if ctrl_shift => self.command(Command::ImportExplorerTabs),
+            Key::G if ctrl_shift => self.command(Command::JumpClipboardPath),
+            Key::Enter if alt_only => self.command(Command::Properties),
+            Key::I if alt_only => self.command(Command::Properties),
+            Key::F10 if shift_only => self.command(Command::ShowContextMenu),
+            Key::ArrowLeft if alt_only => self.command(Command::Back),
+            Key::ArrowRight if alt_only => self.command(Command::Forward),
+            Key::ArrowUp if alt_only => self.command(Command::Up),
             _ => return false,
         }
         true
@@ -172,26 +190,25 @@ impl LumenApp {
         handled_paste: bool,
     ) {
         use egui::Key;
-        let count = self.active().entries.len();
-        // Step from the moving end of the selection so Shift+Arrow keeps growing.
-        let current = self.active().cursor.or_else(|| self.active().selection.iter().next().copied());
         let page = self.page_rows.max(1);
         let row_step = self.vertical_arrow_step();
         for event in &input.events {
             let egui::Event::Key { key, pressed: true, .. } = event else { continue };
             match key {
-                Key::Enter if !alt => self.command(Command::Open),
+                Key::Enter if !alt && !ctrl => self.command(Command::Open),
                 Key::Space if !ctrl && !alt && !shift && self.typed.buf.is_empty() => {
                     self.command(Command::ToggleQuickLook);
                 }
                 Key::Backspace if alt || !ctrl => {
                     self.command(if self.settings.backspace_goes_back { Command::Back } else { Command::Up })
                 }
-                Key::F2 => self.command(Command::Rename),
-                Key::Delete => self.command(if shift { Command::PermanentDelete } else { Command::Delete }),
-                Key::C if ctrl && !shift && !handled_copy => self.copy_selection(false),
-                Key::X if ctrl && !handled_cut => self.copy_selection(true),
-                Key::V if ctrl && !handled_paste => self.paste(),
+                Key::F2 if !ctrl && !alt && !shift => self.command(Command::Rename),
+                Key::Delete if !ctrl && !alt => {
+                    self.command(if shift { Command::PermanentDelete } else { Command::Delete });
+                }
+                Key::C if ctrl && !shift && !alt && !handled_copy => self.copy_selection(false),
+                Key::X if ctrl && !shift && !alt && !handled_cut => self.copy_selection(true),
+                Key::V if ctrl && !shift && !alt && !handled_paste => self.paste(),
                 Key::Home
                 | Key::End
                 | Key::PageUp
@@ -199,28 +216,48 @@ impl LumenApp {
                 | Key::ArrowDown
                 | Key::ArrowUp
                 | Key::ArrowLeft
-                | Key::ArrowRight => {
-                    if count == 0 {
+                | Key::ArrowRight
+                    if !alt =>
+                {
+                    let tab = self.active();
+                    let visible = tab.visible_entry_indices();
+                    if visible.is_empty() {
                         continue;
                     }
-                    // With nothing selected any direction lands on the first row,
+                    // Step from the moving end of the selection so Shift+Arrow keeps growing.
+                    let current =
+                        tab.cursor.or_else(|| tab.selection.iter().next().copied()).filter(|idx| visible.contains(idx));
+                    // With nothing selected any direction lands on the first visible row,
                     // except End; Explorer behaves the same way.
                     let target = match (current, key) {
-                        (None, Key::End) => count - 1,
-                        (None, _) => 0,
-                        (Some(_), Key::Home) => 0,
-                        (Some(_), Key::End) => count - 1,
-                        (Some(base), Key::PageUp) => base.saturating_sub(page),
-                        (Some(base), Key::PageDown) => (base + page).min(count - 1),
+                        (None, Key::End) => *visible.last().unwrap(),
+                        (None, _) => visible[0],
+                        (Some(_), Key::Home) => visible[0],
+                        (Some(_), Key::End) => *visible.last().unwrap(),
+                        (Some(base), Key::PageUp) => {
+                            tab.step_visible_entry(Some(base), -(page as isize)).unwrap_or(visible[0])
+                        }
+                        (Some(base), Key::PageDown) => {
+                            tab.step_visible_entry(Some(base), page as isize).unwrap_or(*visible.last().unwrap())
+                        }
                         // In horizontal-row grid views (Tiles/Icons), Up/Down jump a
                         // row (`grid_columns`) and Left/Right step by one item.
-                        (Some(base), Key::ArrowDown) => (base + row_step).min(count - 1),
-                        (Some(base), Key::ArrowUp) => base.saturating_sub(row_step),
-                        (Some(base), Key::ArrowRight) => (base + 1).min(count - 1),
-                        (Some(base), Key::ArrowLeft) => base.saturating_sub(1),
+                        (Some(base), Key::ArrowDown) => {
+                            tab.step_visible_entry(Some(base), row_step as isize).unwrap_or(*visible.last().unwrap())
+                        }
+                        (Some(base), Key::ArrowUp) => {
+                            tab.step_visible_entry(Some(base), -(row_step as isize)).unwrap_or(visible[0])
+                        }
+                        (Some(base), Key::ArrowRight) => {
+                            tab.step_visible_entry(Some(base), 1).unwrap_or(*visible.last().unwrap())
+                        }
+                        (Some(base), Key::ArrowLeft) => tab.step_visible_entry(Some(base), -1).unwrap_or(visible[0]),
                         _ => continue,
                     };
                     if shift {
+                        if self.active().anchor.is_some_and(|a| !visible.contains(&a)) {
+                            self.active_mut().anchor = None;
+                        }
                         self.active_mut().extend_selection_to(target);
                         self.active_mut().scroll_to = Some(target);
                     } else {
@@ -252,6 +289,9 @@ impl LumenApp {
                 if now - self.typed.at > 0.9 {
                     self.typed.buf.clear();
                 }
+                if self.typed.buf.is_empty() && text.chars().all(char::is_whitespace) {
+                    continue;
+                }
                 self.typed.at = now;
                 self.typed.buf.push_str(text);
                 typed = true;
@@ -261,19 +301,20 @@ impl LumenApp {
             return;
         }
         let needle = self.typed.buf.to_lowercase();
-        let entries = self.active().entries.clone();
-        if entries.is_empty() {
+        let visible = self.active().visible_entry_indices();
+        if visible.is_empty() {
             return;
         }
-        let start = self.active().selection.iter().next().copied().unwrap_or(0);
-        // Search forward from the current row, wrapping: same as Explorer.
-        let found = entries
+        let entries = self.active().entries.clone();
+        let current = self.active().cursor.or_else(|| self.active().selection.iter().next().copied());
+        let start_pos = current.and_then(|idx| visible.iter().position(|&v| v == idx)).unwrap_or(0);
+        // Search forward from the current visible row, wrapping: same as Explorer.
+        let found = visible
             .iter()
-            .enumerate()
-            .skip(start)
-            .chain(entries.iter().enumerate().take(start))
-            .find(|(_, entry)| entry.name.to_lowercase().starts_with(&needle))
-            .map(|(index, _)| index);
+            .skip(start_pos)
+            .chain(visible.iter().take(start_pos))
+            .copied()
+            .find(|&index| entries.get(index).is_some_and(|entry| entry.name.to_lowercase().starts_with(&needle)));
         if let Some(index) = found {
             self.active_mut().focus_row(index);
         }
@@ -284,10 +325,14 @@ impl LumenApp {
         if input.key_pressed(Key::Escape) {
             self.address.editing = false;
             self.address.suggestions.clear();
+            self.address_suggest_rect = None;
+            self.address_cursor_end = false;
             return;
         }
         if input.key_pressed(Key::Enter) && !platform::is_ime_composing() {
             self.address.editing = false;
+            self.address_suggest_rect = None;
+            self.address_cursor_end = false;
             if let Some(index) = self.address.suggestion_index {
                 self.apply_suggestion(index);
             } else {
@@ -303,6 +348,7 @@ impl LumenApp {
             {
                 self.address.buf = format!("{}\\", path.to_string_lossy());
                 self.address.suggestions_source.clear();
+                self.address_cursor_end = true;
             }
             return;
         }
@@ -344,6 +390,8 @@ impl LumenApp {
         self.address.editing = false;
         self.address.suggestions.clear();
         self.address.suggestion_index = None;
+        self.address_suggest_rect = None;
+        self.address_cursor_end = false;
         self.navigate_to_path(&path);
     }
 
@@ -351,6 +399,7 @@ impl LumenApp {
         use egui::Key;
         if input.key_pressed(Key::Escape) {
             self.rename = None;
+            self.flush_pending_refresh();
             return;
         }
         if input.key_pressed(Key::F2)
@@ -363,15 +412,24 @@ impl LumenApp {
         if input.key_pressed(Key::Tab) && !platform::is_ime_composing() {
             let current_row = self.rename.as_ref().map(|r| r.row).unwrap_or(0);
             let step: isize = if input.modifiers.shift { -1 } else { 1 };
-            self.finish_rename();
-            let count = self.active().entries.len();
-            if count > 0 {
-                let next = (current_row as isize + step).rem_euclid(count as isize) as usize;
+            self.finish_rename_with_flush(false);
+            let visible = self.active().visible_entry_indices();
+            if !visible.is_empty() {
+                let cur_pos = visible.iter().position(|&idx| idx == current_row).unwrap_or(0);
+                let next_pos = (cur_pos as isize + step).rem_euclid(visible.len() as isize) as usize;
+                let next = visible[next_pos];
                 self.active_mut().focus_row(next);
-                if let Some(entry) = self.active().entries.get(next) {
+                if let Some(entry) = self.active().entries.get(next)
+                    && let Some(target_path) = entry.path.clone()
+                {
                     let name = entry.name.clone();
-                    self.rename = Some(RenameState { row: next, buf: name, focus: true, select_all: false });
+                    self.rename =
+                        Some(RenameState { row: next, target_path, buf: name, focus: true, select_all: false });
+                } else {
+                    self.flush_pending_refresh();
                 }
+            } else {
+                self.flush_pending_refresh();
             }
             return;
         }
